@@ -1,12 +1,16 @@
-param(
+﻿param(
     [switch]$AnalyzeOnly,
     [switch]$Mock,
     [string]$PromptFile,
     [string]$TemplateFile,
-    [string]$Model
+    [string]$Model,
+    [string]$lecture,
+    [string]$page
 )
 
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 trap [System.Management.Automation.PipelineStoppedException] {
     Write-Host "[취소] Ctrl+C로 실행이 중단되었습니다."
     exit 130
@@ -25,6 +29,7 @@ if (-not (Test-Path $TempPath)) {
 
 $env:TEMP = $TempPath
 $env:TMP = $TempPath
+$env:PYTHONIOENCODING = "utf-8"
 
 function Get-BasePythonPath {
     $Resolved = ""
@@ -130,6 +135,16 @@ if ($TemplateFile) {
 if ($Model) {
     $ArgsList += "--model"
     $ArgsList += $Model
+}
+
+if ($lecture) {
+    $ArgsList += "--lecture"
+    $ArgsList += $lecture
+}
+
+if ($page) {
+    $ArgsList += "--page"
+    $ArgsList += $page
 }
 
 Push-Location $ProjectRoot

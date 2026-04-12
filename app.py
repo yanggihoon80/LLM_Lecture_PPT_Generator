@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import locale
+import math
 import os
 import re
 import subprocess
@@ -14,8 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
+from PIL import Image
+from pptx.dml.color import RGBColor
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.text import MSO_VERTICAL_ANCHOR, PP_ALIGN
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR, MSO_SHAPE_TYPE
+from pptx.oxml.ns import qn
+from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Pt
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,14 +48,26 @@ Return JSON only.
       "source_slide": 21,
       "title": "string",
       "why": "string",
-      "bullets": ["string", "string"],
+      "bullets": [
+        "string",
+        {"text": "string", "level": 1, "bullet": true}
+      ],
       "example": "string",
       "practice_prompt": "string",
       "transition": "string",
       "image_prompt": "string",
+      "visual_type": "bullets | table | diagram",
       "table": {
         "headers": ["string", "string"],
         "rows": [["string", "string"]]
+      },
+      "diagram": {
+        "diagram_type": "process | comparison | hierarchy | cycle | relationship",
+        "layout_direction": "horizontal | vertical | radial",
+        "title": "string",
+        "nodes": ["string", "string"],
+        "links": [["string", "string"]],
+        "notes": "string"
       }
     }
   ]
@@ -63,14 +81,26 @@ Rules:
 - Slide 20 must use slide_role "summary".
 - Use the provided content template slide as the main source_slide unless there is a strong reason not to.
 - The template structure is simple: left-top bullet text area and right-bottom image area.
-- Do not use tables unless the prompt strongly requires a comparison table.
+- Every slide should choose the clearest presentation form among bullets, table, or diagram.
+- "bullets" may contain plain strings or objects with fields {text, level, bullet}.
+- Use level 1 or level 2 bullet objects when a hierarchical explanation is clearer.
+- Use the "example" field only when an inline example is truly useful. It will be rendered in the slide body as an `ex>` line.
+- Set "visual_type" to "bullets" when normal bullet explanation is enough.
+- Set "visual_type" to "table" when the content is clearer as rows and columns.
+- Set "visual_type" to "diagram" when the content is clearer as process flow, comparison, hierarchy, cycle, or relationship.
+- When "visual_type" is "table", fill the "table" object with practical headers and rows.
+- When "visual_type" is "diagram", fill the "diagram" object with structured nodes and links.
+- When "visual_type" is "diagram", also choose "layout_direction" based on whether the flow reads better horizontally, vertically, or radially.
 - Every bullet must be a presentation-ready sentence of about 18 to 35 Korean characters when possible.
 - Avoid essay-like long sentences.
 - Avoid keyword-only short fragments.
 - Prefer one idea per bullet and keep the wording easy to say aloud in class.
-- Prefer concise nominal endings such as "~임", "~함", "~음", "~필요", "~중심".
-- Avoid sentence endings like "~다", "~입니다", "~같다" in slide bullets.
+- Prefer concise nominal endings such as "~?", "~?", "~?", "~??", "~??".
+- Avoid sentence endings like "~?", "~???", "~??" in slide bullets.
 - Put the image prompt in "image_prompt" when a visual aid is useful.
+- Make image prompts favor a wide horizontal composition for a slide image frame.
+- Keep the main subject centered with safe margins on all sides.
+- Avoid important objects touching the edges and avoid text near the image border.
 """.strip()
 
 
@@ -83,7 +113,8 @@ def load_env_file(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+        normalized_key = key.strip().lstrip("\ufeff")
+        os.environ.setdefault(normalized_key, value.strip())
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -109,6 +140,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--curriculum-file",
         help="Curriculum text file path for multi-session generation. Default: ./prompts/curriculum.txt when present",
+    )
+    parser.add_argument(
+        "--lecture",
+        help="Comma-separated lecture/session numbers to run. Example: 1 or 1,3",
+    )
+    parser.add_argument(
+        "--page",
+        help="Comma-separated slide numbers to render within selected lecture(s). Requires --lecture. Example: 1 or 1,3",
     )
     parser.add_argument(
         "--output",
@@ -279,6 +318,63 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
     return sessions
 
 
+def parse_lecture_selection(raw: str | None) -> set[int]:
+    if not raw:
+        return set()
+
+    selected: set[int] = set()
+    for token in raw.split(","):
+        value = token.strip()
+        if not value:
+            continue
+        if not value.isdigit():
+            raise ValueError(
+                f"Invalid lecture selection '{value}'. Use numbers like 1 or 1,3."
+            )
+        selected.add(int(value))
+    return selected
+
+
+def parse_page_selection(raw: str | None) -> set[int]:
+    if not raw:
+        return set()
+
+    selected: set[int] = set()
+    for token in raw.split(","):
+        value = token.strip()
+        if not value:
+            continue
+        if not value.isdigit():
+            raise ValueError(
+                f"Invalid page selection '{value}'. Use numbers like 1 or 1,3."
+            )
+        page_no = int(value)
+        if page_no <= 0:
+            raise ValueError("Page numbers must be 1 or greater.")
+        selected.add(page_no)
+    return selected
+
+
+def filter_slide_plan_pages(
+    plan: dict[str, Any], selected_pages: set[int]
+) -> dict[str, Any]:
+    if not selected_pages:
+        return plan
+
+    filtered_slides = [
+        slide
+        for slide in plan["slides"]
+        if int(slide.get("slide_number", 0)) in selected_pages
+    ]
+    if not filtered_slides:
+        selected_text = ", ".join(str(number) for number in sorted(selected_pages))
+        raise ValueError(f"No matching slide numbers found in plan for: {selected_text}")
+
+    filtered_plan = dict(plan)
+    filtered_plan["slides"] = filtered_slides
+    return filtered_plan
+
+
 def render_session_prompt(prompt_template: str, session: dict[str, Any]) -> str:
     core_lines = "\n".join(f"- {item}" for item in session["core_points"])
     meta_lines: list[str] = []
@@ -309,12 +405,25 @@ def render_session_prompt(prompt_template: str, session: dict[str, Any]) -> str:
     return rendered
 
 
+def resolve_section_label(plan: dict[str, Any], lecture_title: str | None = None) -> str:
+    if lecture_title:
+        return lecture_title
+    return plan.get("section_label", plan.get("deck_title", "강의안"))
+
+
 def build_image_output_dir_for_session(session_prefix: str | None = None) -> Path:
     if not session_prefix:
         return build_image_output_dir()
     path = build_image_output_dir() / session_prefix
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def format_page_suffix(selected_pages: set[int]) -> str:
+    if not selected_pages:
+        return ""
+    joined = "_".join(str(number) for number in sorted(selected_pages))
+    return f"_page{joined}"
 
 
 def remove_all_shapes(slide) -> None:
@@ -389,11 +498,11 @@ def set_text(shape, text: str) -> None:
     text_frame.paragraphs[0].text = text
 
 
-def set_paragraphs(shape, lines: list[str]) -> None:
+def set_paragraphs(shape, lines: list[Any]) -> None:
     if not getattr(shape, "has_text_frame", False):
         return
 
-    cleaned = [line.strip() for line in lines if line and line.strip()]
+    cleaned = [line for line in lines if line]
     text_frame = shape.text_frame
     text_frame.clear()
 
@@ -401,10 +510,55 @@ def set_paragraphs(shape, lines: list[str]) -> None:
         text_frame.paragraphs[0].text = ""
         return
 
-    for idx, line in enumerate(cleaned):
+    for idx, entry in enumerate(cleaned):
+        if isinstance(entry, dict):
+            line = str(entry.get("text") or "").strip()
+            level = int(entry.get("level", 0) or 0)
+            use_bullet = bool(entry.get("bullet", True))
+        else:
+            line = str(entry).strip()
+            level = 0
+            use_bullet = True
+
+        if not line:
+            continue
+
         paragraph = text_frame.paragraphs[0] if idx == 0 else text_frame.add_paragraph()
         paragraph.text = line
-        paragraph.level = 0
+        paragraph.level = max(0, level)
+        if use_bullet:
+            apply_bullet_to_paragraph(paragraph)
+        else:
+            remove_bullet_from_paragraph(paragraph)
+
+
+def apply_bullet_to_paragraph(paragraph) -> None:
+    p_pr = paragraph._p.get_or_add_pPr()
+
+    for node in list(p_pr):
+        if any(
+            node.tag.endswith(suffix)
+            for suffix in ("}buNone", "}buAutoNum", "}buBlip", "}buChar")
+        ):
+            p_pr.remove(node)
+
+    bullet = OxmlElement("a:buChar")
+    bullet.set("char", "•")
+    p_pr.append(bullet)
+
+
+def remove_bullet_from_paragraph(paragraph) -> None:
+    p_pr = paragraph._p.get_or_add_pPr()
+
+    for node in list(p_pr):
+        if any(
+            node.tag.endswith(suffix)
+            for suffix in ("}buNone", "}buAutoNum", "}buBlip", "}buChar")
+        ):
+            p_pr.remove(node)
+
+    bullet_none = OxmlElement("a:buNone")
+    p_pr.append(bullet_none)
 
 
 def apply_font_style(shape, font_name: str, font_size: int, bold: bool | None = None) -> None:
@@ -531,6 +685,52 @@ def fill_table(shape, table_data: dict[str, Any]) -> None:
         for col_idx, cell in enumerate(row[: len(table.columns)]):
             table.cell(row_idx, col_idx).text = str(cell)
 
+    for row in table.rows:
+        for cell in row.cells:
+            apply_table_cell_style(cell)
+
+
+def set_cell_border(cell, side: str, color: str = "4C72B0", width: int = 12700) -> None:
+    tc = cell._tc
+    tc_pr = tc.get_or_add_tcPr()
+    edge = tc_pr.find(qn(f"a:{side}"))
+    if edge is None:
+        edge = OxmlElement(f"a:{side}")
+        tc_pr.append(edge)
+    edge.set("w", str(width))
+    edge.set("cap", "flat")
+    edge.set("cmpd", "sng")
+    edge.set("algn", "ctr")
+
+    solid_fill = edge.find(qn("a:solidFill"))
+    if solid_fill is None:
+        solid_fill = OxmlElement("a:solidFill")
+        edge.append(solid_fill)
+    srgb = solid_fill.find(qn("a:srgbClr"))
+    if srgb is None:
+        srgb = OxmlElement("a:srgbClr")
+        solid_fill.append(srgb)
+    srgb.set("val", color)
+
+    prst_dash = edge.find(qn("a:prstDash"))
+    if prst_dash is None:
+        prst_dash = OxmlElement("a:prstDash")
+        edge.append(prst_dash)
+    prst_dash.set("val", "solid")
+
+
+def apply_table_cell_style(cell) -> None:
+    for paragraph in cell.text_frame.paragraphs:
+        paragraph.font.name = "맑은 고딕"
+        paragraph.font.size = Pt(11)
+        paragraph.line_spacing = 1.2
+        for run in paragraph.runs:
+            run.font.name = "맑은 고딕"
+            run.font.size = Pt(11)
+
+    for side in ("lnL", "lnR", "lnT", "lnB"):
+        set_cell_border(cell, side)
+
 
 def get_first_table_spec(slide) -> dict[str, Any] | None:
     for shape in slide.shapes:
@@ -549,10 +749,29 @@ def get_first_table_spec(slide) -> dict[str, Any] | None:
 def add_blank_table_from_source(target_slide, source_slide, table_data: dict[str, Any]) -> None:
     table_spec = get_first_table_spec(source_slide)
     if not table_spec:
-        return
+        fallback_spec = get_left_bottom_diagram_spec(source_slide)
+        if not fallback_spec:
+            return
+        table_spec = {
+            "rows": 4,
+            "cols": 3,
+            "left": fallback_spec["left"],
+            "top": fallback_spec["top"],
+            "width": fallback_spec["width"],
+            "height": fallback_spec["height"],
+        }
 
     rows = max(len(table_data.get("rows", [])) + 1, table_spec["rows"])
     cols = max(len(table_data.get("headers", [])), table_spec["cols"])
+    remove_non_text_shapes_in_area(
+        target_slide,
+        {
+            "left": table_spec["left"],
+            "top": table_spec["top"],
+            "width": table_spec["width"],
+            "height": table_spec["height"],
+        },
+    )
     table_shape = target_slide.shapes.add_table(
         rows,
         cols,
@@ -563,6 +782,520 @@ def add_blank_table_from_source(target_slide, source_slide, table_data: dict[str
     )
     fill_table(table_shape, table_data)
 
+
+def remove_non_text_shapes_in_area(slide, area: dict[str, Any]) -> None:
+    left = int(area["left"])
+    top = int(area["top"])
+    right = left + int(area["width"])
+    bottom = top + int(area["height"])
+
+    for shape in list(slide.shapes):
+        if getattr(shape, "has_text_frame", False):
+            continue
+        shape_left = int(shape.left)
+        shape_top = int(shape.top)
+        shape_right = shape_left + int(shape.width)
+        shape_bottom = shape_top + int(shape.height)
+
+        overlap = not (
+            shape_right <= left
+            or shape_left >= right
+            or shape_bottom <= top
+            or shape_top >= bottom
+        )
+        if overlap:
+            shape.element.getparent().remove(shape.element)
+
+
+def get_left_bottom_diagram_spec(source_slide) -> dict[str, Any] | None:
+    picture_spec = get_main_picture_spec(source_slide)
+    if not picture_spec:
+        return None
+
+    gap_x = max(int(picture_spec["width"] * 0.08), 120000)
+    gap_y = max(int(picture_spec["height"] * 0.08), 120000)
+    text_shapes = iter_text_shapes(source_slide)
+    text_left = min((int(shape.left) for shape in text_shapes), default=0)
+    text_bottom = max(
+        (int(shape.top + shape.height) for shape in text_shapes),
+        default=int(picture_spec["top"]),
+    )
+
+    left = text_left
+    top = max(int(picture_spec["top"]), text_bottom + gap_y)
+    right = int(picture_spec["left"] - gap_x)
+    bottom = int(picture_spec["top"] + picture_spec["height"])
+    width = right - left
+    height = bottom - top
+
+    min_width = max(int(picture_spec["width"] * 0.35), 1200000)
+    min_height = max(int(picture_spec["height"] * 0.22), 900000)
+    if width < min_width or height < min_height:
+        return None
+
+    return {
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+    }
+
+
+def build_diagram_positions(
+    diagram_type: str,
+    layout_direction: str,
+    node_count: int,
+    area: dict[str, Any],
+) -> list[tuple[int, int, int, int]]:
+    left = int(area["left"])
+    top = int(area["top"])
+    width = int(area["width"])
+    height = int(area["height"])
+    gap_x = max(int(width * 0.035), 100000)
+    gap_y = max(int(height * 0.05), 90000)
+
+    if node_count <= 0:
+        return []
+
+    if diagram_type in {"process", "comparison", "relationship"}:
+        if layout_direction == "vertical":
+            box_width = int(width * 0.70)
+            box_height = int((height - gap_y * (node_count - 1)) / max(node_count, 1))
+            x = left + int((width - box_width) / 2)
+            return [
+                (
+                    x,
+                    top + idx * (box_height + gap_y),
+                    box_width,
+                    box_height,
+                )
+                for idx in range(node_count)
+            ]
+
+        box_width = int((width - gap_x * (node_count - 1)) / max(node_count, 1))
+        box_height = int(height * 0.58)
+        y = top + int((height - box_height) / 2)
+        return [
+            (
+                left + idx * (box_width + gap_x),
+                y,
+                box_width,
+                box_height,
+            )
+            for idx in range(node_count)
+        ]
+
+    if diagram_type == "hierarchy":
+        if node_count == 1:
+            return [(left + int(width * 0.25), top + int(height * 0.2), int(width * 0.5), int(height * 0.3))]
+
+        positions: list[tuple[int, int, int, int]] = []
+        top_box_width = int(width * 0.42)
+        top_box_height = int(height * 0.32)
+        positions.append(
+            (
+                left + int((width - top_box_width) / 2),
+                top + gap_y,
+                top_box_width,
+                top_box_height,
+            )
+        )
+
+        bottom_count = node_count - 1
+        bottom_gap = gap_x
+        bottom_box_width = int((width - bottom_gap * (bottom_count - 1)) / max(bottom_count, 1))
+        bottom_box_height = int(height * 0.30)
+        bottom_y = top + height - bottom_box_height - int(gap_y * 0.6)
+        for idx in range(bottom_count):
+            positions.append(
+                (
+                    left + idx * (bottom_box_width + bottom_gap),
+                    bottom_y,
+                    bottom_box_width,
+                    bottom_box_height,
+                )
+            )
+        return positions
+
+    if diagram_type == "cycle":
+        if node_count == 1:
+            return [(left + int(width * 0.25), top + int(height * 0.25), int(width * 0.5), int(height * 0.3))]
+
+        box_width = int(width * 0.30)
+        box_height = int(height * 0.24)
+        center_x = left + width / 2
+        center_y = top + height / 2
+        radius_x = max((width - box_width) / 2.6, box_width / 2)
+        radius_y = max((height - box_height) / 2.6, box_height / 2)
+        positions = []
+        for idx in range(node_count):
+            angle = (2 * math.pi * idx / node_count) - (math.pi / 2)
+            x = int(center_x + radius_x * math.cos(angle) - box_width / 2)
+            y = int(center_y + radius_y * math.sin(angle) - box_height / 2)
+            positions.append((x, y, box_width, box_height))
+        return positions
+
+    if layout_direction == "vertical":
+        box_width = int(width * 0.70)
+        box_height = int((height - gap_y * (node_count - 1)) / max(node_count, 1))
+        x = left + int((width - box_width) / 2)
+        return [
+            (
+                x,
+                top + idx * (box_height + gap_y),
+                box_width,
+                box_height,
+            )
+            for idx in range(node_count)
+        ]
+
+    box_width = int((width - gap_x * (node_count - 1)) / max(node_count, 1))
+    box_height = int(height * 0.58)
+    y = top + int((height - box_height) / 2)
+    return [
+        (
+            left + idx * (box_width + gap_x),
+            y,
+            box_width,
+            box_height,
+        )
+        for idx in range(node_count)
+    ]
+
+
+def add_diagram_box(slide, text: str, left: int, top: int, width: int, height: int):
+    return add_diagram_shape(
+        slide,
+        text=text,
+        left=left,
+        top=top,
+        width=width,
+        height=height,
+        shape_type=MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+    )
+
+
+def add_diagram_shape(
+    slide,
+    text: str,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    shape_type,
+):
+    shape = slide.shapes.add_shape(
+        shape_type,
+        left,
+        top,
+        width,
+        height,
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor(241, 246, 255)
+    shape.line.color.rgb = RGBColor(76, 114, 176)
+    shape.line.width = 1
+    set_text(shape, text)
+    shape.text_frame.word_wrap = True
+    shape.text_frame.vertical_anchor = MSO_VERTICAL_ANCHOR.MIDDLE
+    shape.text_frame.margin_left = Pt(7)
+    shape.text_frame.margin_right = Pt(7)
+    shape.text_frame.margin_top = Pt(4)
+    shape.text_frame.margin_bottom = Pt(4)
+    font_size = 12
+    text_len = len(text.strip())
+    if text_len >= 24:
+        font_size = 9
+    elif text_len >= 16:
+        font_size = 10
+    elif text_len >= 10:
+        font_size = 11
+    apply_default_text_style(shape, font_name="Malgun Gothic", font_size=font_size)
+    for paragraph in shape.text_frame.paragraphs:
+        paragraph.alignment = PP_ALIGN.CENTER
+        paragraph.line_spacing = 1.0
+    return shape
+
+
+def render_process_diagram(slide, positions, nodes) -> list[Any]:
+    shapes = []
+    for node_text, (left, top, width, height) in zip(nodes, positions):
+        shapes.append(
+            add_diagram_shape(
+                slide,
+                text=node_text,
+                left=left,
+                top=top,
+                width=width,
+                height=height,
+                shape_type=MSO_AUTO_SHAPE_TYPE.CHEVRON,
+            )
+        )
+    return shapes
+
+
+def render_comparison_diagram(slide, positions, nodes) -> list[Any]:
+    shapes = []
+    for idx, (node_text, (left, top, width, height)) in enumerate(zip(nodes, positions)):
+        shape_type = (
+            MSO_AUTO_SHAPE_TYPE.HEXAGON
+            if idx == 0 or idx == len(nodes) - 1
+            else MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE
+        )
+        shapes.append(
+            add_diagram_shape(
+                slide,
+                text=node_text,
+                left=left,
+                top=top,
+                width=width,
+                height=height,
+                shape_type=shape_type,
+            )
+        )
+    return shapes
+
+
+def render_cycle_diagram(slide, positions, nodes) -> list[Any]:
+    shapes = []
+    for node_text, (left, top, width, height) in zip(nodes, positions):
+        shapes.append(
+            add_diagram_shape(
+                slide,
+                text=node_text,
+                left=left,
+                top=top,
+                width=width,
+                height=height,
+                shape_type=MSO_AUTO_SHAPE_TYPE.OVAL,
+            )
+        )
+    return shapes
+
+
+def render_relationship_diagram(slide, positions, nodes) -> list[Any]:
+    shapes = []
+    center_index = len(nodes) // 2
+    for idx, (node_text, (left, top, width, height)) in enumerate(zip(nodes, positions)):
+        shape_type = (
+            MSO_AUTO_SHAPE_TYPE.OVAL
+            if idx == center_index
+            else MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE
+        )
+        shapes.append(
+            add_diagram_shape(
+                slide,
+                text=node_text,
+                left=left,
+                top=top,
+                width=width,
+                height=height,
+                shape_type=shape_type,
+            )
+        )
+    return shapes
+
+
+def render_hierarchy_diagram(slide, positions, nodes) -> list[Any]:
+    shapes = []
+    for idx, (node_text, (left, top, width, height)) in enumerate(zip(nodes, positions)):
+        shape_type = (
+            MSO_AUTO_SHAPE_TYPE.OVAL
+            if idx == 0
+            else MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE
+        )
+        shapes.append(
+            add_diagram_shape(
+                slide,
+                text=node_text,
+                left=left,
+                top=top,
+                width=width,
+                height=height,
+                shape_type=shape_type,
+            )
+        )
+    return shapes
+
+
+def infer_diagram_type(slide_data: dict[str, Any], diagram_data: dict[str, Any]) -> str:
+    raw_type = str(diagram_data.get("diagram_type") or "").strip().lower()
+    if raw_type in {"process", "comparison", "hierarchy", "cycle", "relationship"}:
+        if raw_type != "process":
+            return raw_type
+
+    title = str(slide_data.get("title") or "")
+    bullets = " ".join(str(item) for item in (slide_data.get("bullets") or []))
+    text = f"{title} {bullets}"
+
+    if any(keyword in text for keyword in ["비교", "차이", "장단점", "대비"]):
+        return "comparison"
+    if any(keyword in text for keyword in ["순환", "반복", "루프", "사이클"]):
+        return "cycle"
+    if any(keyword in text for keyword in ["계층", "구조", "분류", "상위", "하위"]):
+        return "hierarchy"
+    if any(keyword in text for keyword in ["관계", "연결", "연동", "역할", "주체", "MCP", "API"]):
+        return "relationship"
+    return "process"
+
+
+def infer_diagram_direction(diagram_type: str, slide_data: dict[str, Any], diagram_data: dict[str, Any]) -> str:
+    raw_direction = str(diagram_data.get("layout_direction") or "").strip().lower()
+    if raw_direction in {"horizontal", "vertical", "radial"}:
+        return raw_direction
+
+    if diagram_type == "cycle":
+        return "radial"
+    if diagram_type == "hierarchy":
+        return "vertical"
+
+    title = str(slide_data.get("title") or "")
+    bullets = " ".join(
+        str(item.get("text") if isinstance(item, dict) else item)
+        for item in (slide_data.get("bullets") or [])
+    )
+    text = f"{title} {bullets}"
+    if any(keyword in text for keyword in ["단계", "절차", "순서", "위에서 아래", "입력 후", "다음 단계"]):
+        return "vertical"
+    return "horizontal"
+
+
+def add_connector_line(
+    slide,
+    from_box,
+    to_box,
+    diagram_type: str = "process",
+    layout_direction: str = "horizontal",
+) -> None:
+    from_cx = int(from_box.left + from_box.width / 2)
+    from_cy = int(from_box.top + from_box.height / 2)
+    to_cx = int(to_box.left + to_box.width / 2)
+    to_cy = int(to_box.top + to_box.height / 2)
+
+    dx = to_cx - from_cx
+    dy = to_cy - from_cy
+
+    if layout_direction == "vertical" and diagram_type in {"process", "comparison", "relationship"}:
+        x1 = from_cx
+        y1 = int(from_box.top + from_box.height) if dy >= 0 else int(from_box.top)
+        x2 = to_cx
+        y2 = int(to_box.top) if dy >= 0 else int(to_box.top + to_box.height)
+        connector_type = MSO_CONNECTOR.STRAIGHT
+    elif diagram_type in {"process", "comparison", "relationship"}:
+        x1 = int(from_box.left + from_box.width) if dx >= 0 else int(from_box.left)
+        y1 = from_cy
+        x2 = int(to_box.left) if dx >= 0 else int(to_box.left + to_box.width)
+        y2 = to_cy
+        connector_type = MSO_CONNECTOR.STRAIGHT
+    elif diagram_type == "hierarchy":
+        x1 = from_cx
+        y1 = int(from_box.top + from_box.height)
+        x2 = to_cx
+        y2 = int(to_box.top)
+        connector_type = MSO_CONNECTOR.STRAIGHT
+    else:
+        if abs(dx) >= abs(dy):
+            x1 = int(from_box.left + from_box.width) if dx >= 0 else int(from_box.left)
+            y1 = from_cy
+            x2 = int(to_box.left) if dx >= 0 else int(to_box.left + to_box.width)
+            y2 = to_cy
+        else:
+            x1 = from_cx
+            y1 = int(from_box.top + from_box.height) if dy >= 0 else int(from_box.top)
+            x2 = to_cx
+            y2 = int(to_box.top) if dy >= 0 else int(to_box.top + to_box.height)
+        connector_type = MSO_CONNECTOR.STRAIGHT
+
+    connector = slide.shapes.add_connector(connector_type, x1, y1, x2, y2)
+    connector.line.color.rgb = RGBColor(76, 114, 176)
+    connector.line.width = Pt(1.8 if diagram_type == "process" else 1.4)
+
+
+def add_plain_line(
+    slide, x1: int, y1: int, x2: int, y2: int, width_pt: float = 1.25, arrow_end: bool = False
+):
+    connector = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, x1, y1, x2, y2)
+    connector.line.color.rgb = RGBColor(76, 114, 176)
+    connector.line.width = Pt(width_pt)
+    return connector
+
+
+def render_hierarchy_connectors(slide, node_shapes: list[Any]) -> None:
+    if len(node_shapes) <= 1:
+        return
+
+    parent = node_shapes[0]
+    children = node_shapes[1:]
+    parent_cx = int(parent.left + parent.width / 2)
+    parent_bottom = int(parent.top + parent.height)
+    child_centers = [int(child.left + child.width / 2) for child in children]
+    child_tops = [int(child.top) for child in children]
+    vertical_gap = max(0, min(child_tops) - parent_bottom)
+    trunk_y = int(parent_bottom + vertical_gap * 0.28)
+
+    add_plain_line(slide, parent_cx, parent_bottom, parent_cx, trunk_y, width_pt=1.5, arrow_end=False)
+    add_plain_line(
+        slide,
+        min(child_centers),
+        trunk_y,
+        max(child_centers),
+        trunk_y,
+        width_pt=1.5,
+        arrow_end=False,
+    )
+    for child_cx, child_top in zip(child_centers, child_tops):
+        add_plain_line(slide, child_cx, trunk_y, child_cx, child_top, width_pt=1.5, arrow_end=True)
+
+
+def render_diagram(slide, source_slide, slide_data: dict[str, Any], diagram_data: dict[str, Any]) -> None:
+    diagram_spec = get_left_bottom_diagram_spec(source_slide)
+    if not diagram_spec:
+        return
+
+    nodes = [str(node).strip() for node in (diagram_data.get("nodes") or []) if str(node).strip()]
+    if not nodes:
+        return
+
+    diagram_type = infer_diagram_type(slide_data, diagram_data)
+    layout_direction = infer_diagram_direction(diagram_type, slide_data, diagram_data)
+    remove_non_text_shapes_in_area(slide, diagram_spec)
+    positions = build_diagram_positions(diagram_type, layout_direction, len(nodes), diagram_spec)
+    if not positions:
+        return
+
+    if diagram_type == "process":
+        node_shapes = render_process_diagram(slide, positions, nodes)
+    elif diagram_type == "comparison":
+        node_shapes = render_comparison_diagram(slide, positions, nodes)
+    elif diagram_type == "cycle":
+        node_shapes = render_cycle_diagram(slide, positions, nodes)
+    elif diagram_type == "hierarchy":
+        node_shapes = render_hierarchy_diagram(slide, positions, nodes)
+    elif diagram_type == "relationship":
+        node_shapes = render_relationship_diagram(slide, positions, nodes)
+    else:
+        node_shapes = []
+        for node_text, (left, top, width, height) in zip(nodes, positions):
+            node_shapes.append(add_diagram_box(slide, node_text, left, top, width, height))
+
+    raw_links = diagram_data.get("links") or []
+    if diagram_type == "hierarchy":
+        render_hierarchy_connectors(slide, node_shapes)
+    elif raw_links:
+        link_map = {
+            str(node).strip(): shape
+            for node, shape in zip(nodes, node_shapes)
+        }
+        for link in raw_links:
+            if not isinstance(link, (list, tuple)) or len(link) < 2:
+                continue
+            start_shape = link_map.get(str(link[0]).strip())
+            end_shape = link_map.get(str(link[1]).strip())
+            if start_shape and end_shape:
+                add_connector_line(slide, start_shape, end_shape, diagram_type, layout_direction)
+    else:
+        for start_shape, end_shape in zip(node_shapes, node_shapes[1:]):
+            add_connector_line(slide, start_shape, end_shape, diagram_type, layout_direction)
 
 def normalize_bullet_line(text: str) -> str:
     cleaned = (text or "").strip()
@@ -576,13 +1309,67 @@ def normalize_bullet_line(text: str) -> str:
     return cleaned.strip()
 
 
-def format_main_body(slide_data: dict[str, Any]) -> list[str]:
+def parse_body_entry(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        text = str(item.get("text") or "").strip()
+        if not text:
+            return None
+        return {
+            "text": normalize_bullet_line(text),
+            "level": int(item.get("level", 0) or 0),
+            "bullet": bool(item.get("bullet", True)),
+        }
+
+    raw = str(item or "").strip()
+    if not raw:
+        return None
+
+    level = 0
+    bullet = True
+    text = raw
+
+    if raw.lower().startswith("ex>"):
+        return {
+            "text": raw,
+            "level": 0,
+            "bullet": False,
+        }
+
+    hierarchy_match = re.match(r"^(>{1,3}|\-{1,3})\s*(.+)$", raw)
+    if hierarchy_match:
+        marker = hierarchy_match.group(1)
+        text = hierarchy_match.group(2)
+        level = max(0, len(marker) - 1)
+
+    normalized = normalize_bullet_line(text)
+    if not normalized:
+        return None
+
+    return {
+        "text": normalized,
+        "level": level,
+        "bullet": bullet,
+    }
+
+
+def format_main_body(slide_data: dict[str, Any]) -> list[dict[str, Any]]:
     bullets = slide_data.get("bullets") or []
-    normalized: list[str] = []
+    normalized: list[dict[str, Any]] = []
     for bullet in bullets:
-        line = normalize_bullet_line(str(bullet))
-        if line:
-            normalized.append(line)
+        entry = parse_body_entry(bullet)
+        if entry:
+            normalized.append(entry)
+
+    example_text = str(slide_data.get("example") or "").strip()
+    if example_text:
+        example_text = re.sub(r"^(ex>\s*)+", "", example_text, flags=re.IGNORECASE).strip()
+        normalized.append(
+            {
+                "text": f"ex> {example_text}",
+                "level": 0,
+                "bullet": False,
+            }
+        )
     return normalized
 
 
@@ -679,6 +1466,9 @@ def fill_slide(slide, source_slide, slide_data: dict[str, Any], section_label: s
     if slide_data.get("table"):
         add_blank_table_from_source(slide, source_slide, slide_data["table"])
 
+    if slide_data.get("visual_type") == "diagram" and slide_data.get("diagram"):
+        render_diagram(slide, source_slide, slide_data, slide_data["diagram"])
+
 
 def extract_json_block(text: str) -> dict[str, Any]:
     try:
@@ -763,12 +1553,13 @@ def generate_slide_image(
     image_prompt: str,
     output_dir: Path,
     slide_number: int,
+    image_size: str,
 ) -> Path:
     image_model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
     result = client.images.generate(
         model=image_model,
-        prompt=image_prompt,
-        size="1024x1024",
+        prompt=enhance_image_prompt(image_prompt),
+        size=image_size,
     )
 
     image_path = output_dir / f"slide_{slide_number:02d}.png"
@@ -788,18 +1579,85 @@ def get_cached_image_path(output_dir: Path, slide_number: int) -> Path:
     return output_dir / f"slide_{slide_number:02d}.png"
 
 
+def enhance_image_prompt(image_prompt: str) -> str:
+    base_prompt = (image_prompt or "").strip()
+    if not base_prompt:
+        return base_prompt
+
+    safety_suffix = (
+        " wide horizontal composition, landscape illustration, centered subject, "
+        "safe margins on all sides, no cropped head or hands, no important details near edges, "
+        "no embedded text, no letters, no words, no labels"
+    )
+    return f"{base_prompt}, {safety_suffix}"
+
+
+def get_target_image_size_for_slide(source_slide) -> str:
+    picture_spec = get_main_picture_spec(source_slide)
+    if not picture_spec:
+        return "1536x1024"
+
+    width = int(picture_spec["width"])
+    height = int(picture_spec["height"])
+    if height <= 0:
+        return "1536x1024"
+
+    return "1536x1024" if (width / height) >= 1.0 else "1024x1536"
+
+
+def image_matches_target_size(image_path: Path, expected_size: str) -> bool:
+    try:
+        expected_width, expected_height = [int(value) for value in expected_size.split("x", 1)]
+        with Image.open(image_path) as img:
+            width, height = img.size
+        return width == expected_width and height == expected_height
+    except Exception:
+        return False
+
+
+def fit_image_within_box(
+    image_path: Path, box_left: int, box_top: int, box_width: int, box_height: int
+) -> tuple[int, int, int, int]:
+    with Image.open(image_path) as img:
+        image_width_px, image_height_px = img.size
+
+    if image_width_px <= 0 or image_height_px <= 0:
+        return box_left, box_top, box_width, box_height
+
+    box_ratio = box_width / box_height
+    image_ratio = image_width_px / image_height_px
+
+    if image_ratio >= box_ratio:
+        fitted_width = box_width
+        fitted_height = int(round(box_width / image_ratio))
+    else:
+        fitted_height = box_height
+        fitted_width = int(round(box_height * image_ratio))
+
+    fitted_left = box_left + max(0, (box_width - fitted_width) // 2)
+    fitted_top = box_top + max(0, (box_height - fitted_height) // 2)
+    return fitted_left, fitted_top, fitted_width, fitted_height
+
+
 def replace_slide_image(slide, source_slide, image_path: Path) -> None:
     picture_spec = get_main_picture_spec(source_slide)
     if not picture_spec:
         return
 
     remove_picture_shapes(slide)
-    slide.shapes.add_picture(
-        str(image_path),
+    left, top, width, height = fit_image_within_box(
+        image_path,
         picture_spec["left"],
         picture_spec["top"],
         picture_spec["width"],
         picture_spec["height"],
+    )
+    slide.shapes.add_picture(
+        str(image_path),
+        left,
+        top,
+        width,
+        height,
     )
 
 
@@ -909,61 +1767,220 @@ def build_mock_plan() -> dict[str, Any]:
             "slide_role": "objective",
             "source_slide": 2,
             "title": "학습 목표",
-            "why": "학습 목표를 먼저 이해해야 1시간 수업의 흐름을 따라가기 쉽습니다.",
+            "why": "이번 강의에서 생성형 AI의 개념과 업무 변화의 핵심 흐름을 먼저 이해할 필요가 있음.",
             "bullets": [
-                "생성형 AI와 LLM 개념 구분이 먼저임.",
-                "기존 자동화와 차이 비교가 핵심임.",
-                "업무 변화가 생기는 지점 확인 필요.",
-                "환각과 통제 한계 이해도 필요함.",
+                "생성형 AI와 LLM의 개념을 구분해 이해함",
+                "기존 자동화와 생성형 AI 자동화의 차이를 파악함",
+                "기업 업무에서 활용되는 대표 사례를 살펴봄",
+                "환각과 통제 한계까지 함께 이해함",
             ],
-            "example": "오늘 수업은 개념 이해, 업무 변화, 활용 사례, 한계, 실습 문제 설계 순서로 진행됩니다.",
+            "example": "보고서 작성, 문서 요약, 데이터 분석 설명 같은 실무 장면을 기준으로 학습함",
             "practice_prompt": "",
-            "transition": "먼저 생성형 AI가 무엇인지부터 정의해야 이후 사례를 같은 기준으로 해석할 수 있습니다.",
-            "image_prompt": "교실 수업용 인포그래픽, 생성형 AI 학습 목표 4개를 아이콘으로 정리한 깔끔한 프레젠테이션 스타일",
+            "transition": "먼저 생성형 AI가 무엇인지부터 이해해야 이후 활용 방식도 자연스럽게 연결됨",
+            "image_prompt": "교육용 프레젠테이션 일러스트, 생성형 AI 학습 목표를 4개 키워드로 정리한 장면, 깔끔한 인포그래픽 스타일",
+            "visual_type": "bullets",
         }
     ]
 
-    content_titles = [
-        "생성형 AI란 무엇인가",
-        "LLM은 어떤 역할을 하는가",
-        "생성형 AI가 기존 AI와 다른 이유",
-        "기존 자동화는 어떤 방식으로 동작했는가",
-        "생성형 AI 자동화는 무엇이 달라졌는가",
-        "두 방식의 차이를 표로 비교",
-        "보고서 작성 업무는 어떻게 바뀌는가",
-        "데이터 분석 업무는 어떻게 바뀌는가",
-        "문서 요약 업무는 어떻게 바뀌는가",
-        "기업은 왜 생성형 AI를 도입하는가",
-        "현장에서 자주 쓰는 활용 사례",
-        "활용 효과를 수치로 보면 무엇이 보이는가",
-        "생성형 AI의 가장 큰 한계는 무엇인가",
-        "환각은 왜 발생하는가",
-        "통제가 어려운 이유는 무엇인가",
-        "안전하게 쓰기 위한 운영 원칙",
-    ]
-
-    for idx, title in enumerate(content_titles, start=2):
-        source_slide = 2
-
-        slide = {
-            "slide_number": idx,
-            "slide_role": "content",
-            "source_slide": source_slide,
-            "title": title,
-            "why": f"{title}를 알아야 생성형 AI를 업무 변화 관점에서 정확히 설명할 수 있습니다.",
+    content_slides: list[dict[str, Any]] = [
+        {
+            "title": "생성형 AI란 무엇인가",
+            "why": "생성형 AI의 정의를 먼저 이해해야 이후 활용 방식과 한계를 정확히 설명할 수 있음.",
             "bullets": [
-                f"{title}의 핵심 뜻 이해가 먼저임.",
-                "중요한 특징을 짧게 정리한 내용임.",
-                "실제 업무와 연결되는 지점 설명 중심.",
-                "다음 내용으로 이어지게 구성한 흐름임.",
+                "생성형 AI는 새 결과물을 만들어 내는 AI임",
+                "기존 데이터를 분류하는 AI와 역할이 다름",
+                "문장, 이미지, 요약처럼 새로운 출력을 생성함",
+                "입력 방식에 따라 결과 품질이 크게 달라짐",
             ],
-            "example": f"{title} 예시: 주간 업무 보고 초안을 AI가 먼저 만들고 담당자가 검토해 최종본을 확정하는 방식입니다.",
-            "practice_prompt": "너는 실무 교육 강사야. 위 개념을 초보 직장인이 이해할 수 있도록 4문장으로 설명해줘.",
-            "transition": "이 개념을 이해하면 다음 장표에서 실제 업무 변화와 연결해서 볼 수 있습니다.",
-            "image_prompt": f"프레젠테이션용 교육 일러스트, {title}를 설명하는 깔끔한 업무 장면, 파란색 계열, 텍스트 없음",
-        }
+            "example": "회의 내용을 입력하면 보고서 초안이 바로 생성되는 방식임",
+        },
+        {
+            "title": "LLM은 어떤 역할을 하는가",
+            "why": "생성형 AI의 중심에 있는 언어 모델의 역할을 알아야 답변 생성 원리를 이해할 수 있음.",
+            "bullets": [
+                "LLM은 대량의 언어 데이터를 학습한 모델임",
+                "입력 문맥을 보고 다음 표현을 예측함",
+                "이 과정을 반복해 문장 단위의 답변을 만듦",
+                "정답 검색보다 확률 기반 생성에 가까움",
+            ],
+            "example": "질문을 주면 가장 그럴듯한 문장 흐름으로 답을 이어 붙임",
+        },
+        {
+            "title": "생성형 AI가 기존 AI와 다른 이유",
+            "why": "기존 AI와의 차이를 알아야 생성형 AI의 업무 활용 포인트가 분명해짐.",
+            "bullets": [
+                "기존 AI는 분류와 예측 중심임",
+                "생성형 AI는 문서와 결과물 생성 중심임",
+                "비정형 업무에도 적용 범위가 넓음",
+                "사용자 지시 방식이 결과를 좌우함",
+            ],
+            "example": "기존 모델은 스팸 메일을 분류하고, 생성형 AI는 답장 초안을 작성함",
+        },
+        {
+            "title": "기존 자동화는 어떤 방식으로 동작했는가",
+            "why": "생성형 AI 자동화와 비교하려면 기존 자동화의 구조부터 이해할 필요가 있음.",
+            "bullets": [
+                "기존 자동화는 규칙 기반으로 움직였음",
+                "정해진 입력과 절차가 있어야 안정적으로 실행됨",
+                "반복 업무에는 강하지만 예외 대응은 약함",
+                "문서 해석이나 요약 같은 비정형 업무에는 한계가 큼",
+            ],
+            "example": "정해진 양식의 엑셀 파일을 읽어 시스템에 입력하는 방식임",
+        },
+        {
+            "title": "생성형 AI 자동화는 무엇이 달라졌는가",
+            "why": "생성형 AI 자동화의 변화 지점을 이해해야 업무 재설계 포인트가 보임.",
+            "bullets": [
+                {"text": "생성형 AI 자동화는 해석과 생성이 함께 들어감", "level": 0},
+                {"text": "문서를 읽고 의미를 파악한 뒤 초안을 작성함", "level": 1},
+                {"text": "사용자 요청에 따라 결과 표현을 바꿀 수 있음", "level": 1},
+                {"text": "예외 상황에서도 설명 가능한 답을 제시함", "level": 1},
+            ],
+            "example": "주간 업무 보고 초안을 만들고 담당자가 검토해 최종본을 확정하는 구조임",
+        },
+        {
+            "title": "두 방식의 차이를 표로 비교",
+            "why": "기존 자동화와 생성형 AI 자동화를 한 화면에서 비교하면 차이가 빠르게 정리됨.",
+            "bullets": [
+                "업무 조건과 출력 방식의 차이를 비교해 볼 필요가 있음",
+                "적용 가능한 업무 범위도 함께 비교하면 이해가 쉬움",
+            ],
+            "example": "정형 업무는 기존 자동화가 강하고, 비정형 문서 업무는 생성형 AI가 강함",
+            "visual_type": "table",
+            "table": {
+                "headers": ["항목", "기존 자동화", "생성형 AI 자동화"],
+                "rows": [
+                    ["입력 조건", "정해진 형식 필요", "자연어 입력 가능"],
+                    ["처리 방식", "규칙 순서대로 실행", "맥락 해석 후 생성"],
+                    ["업무 범위", "반복 정형 업무", "문서 중심 비정형 업무"],
+                    ["예외 대응", "설정 범위 안에서만 가능", "설명과 재작성까지 가능"],
+                ],
+            },
+        },
+        {
+            "title": "보고서 작성 업무는 어떻게 바뀌는가",
+            "why": "대표 업무 사례를 봐야 생성형 AI 도입 효과가 실제로 체감됨.",
+            "bullets": [
+                "핵심 메모만 있어도 초안 작성이 가능함",
+                "문장 표현을 목적에 맞게 다시 정리할 수 있음",
+                "보고 대상에 따라 톤과 구조를 바꿀 수 있음",
+                "작성 시간보다 검토 시간이 더 중요해짐",
+            ],
+            "example": "회의 메모를 입력하면 팀장 보고용 문서 초안을 바로 생성함",
+        },
+        {
+            "title": "데이터 분석 업무는 어떻게 바뀌는가",
+            "why": "숫자 해석과 설명 작성에도 생성형 AI가 큰 역할을 하기 때문임.",
+            "bullets": [
+                "분석 결과를 설명 가능한 문장으로 바꿔 줌",
+                "표와 차트의 핵심 의미를 먼저 정리해 줌",
+                "초안 해석을 빠르게 만든 뒤 사람이 검증함",
+                "결과 전달 속도가 크게 빨라질 수 있음",
+            ],
+            "example": "매출 증감 데이터를 입력하면 변화 원인을 설명하는 요약 문장을 제안함",
+        },
+        {
+            "title": "문서 요약 업무는 어떻게 바뀌는가",
+            "why": "긴 문서를 빠르게 이해하는 업무에서 생성형 AI의 효과가 분명하게 드러남.",
+            "bullets": [
+                "긴 문서를 핵심만 남겨 빠르게 요약함",
+                "필요한 기준에 맞춰 요약 길이를 조절할 수 있음",
+                "핵심 문장과 실행 항목을 따로 정리할 수 있음",
+                "읽는 시간보다 판단 시간이 중요해짐",
+            ],
+            "example": "20페이지 보고서를 5개 핵심 메시지로 압축해 전달함",
+        },
+        {
+            "title": "기업은 왜 생성형 AI를 도입하는가",
+            "why": "도입 배경을 이해해야 현장에서 왜 관심이 큰지 설명할 수 있음.",
+            "bullets": [
+                "문서 업무 생산성을 빠르게 높일 수 있음",
+                "반복되는 설명 작업을 줄일 수 있음",
+                "의사결정용 초안 작성 속도를 올릴 수 있음",
+                "기존 시스템을 크게 바꾸지 않아도 적용이 가능함",
+            ],
+            "example": "고객 문의 답변, 보고서 작성, 회의 요약처럼 바로 체감되는 업무부터 도입함",
+        },
+        {
+            "title": "현장에서 자주 쓰는 활용 사례",
+            "why": "실무 사례를 봐야 학습 내용이 업무 장면과 연결됨.",
+            "bullets": [
+                "보고서 초안 작성",
+                "회의 내용 자동 요약",
+                "분석 결과 설명 문장 생성",
+                "이메일 답변 초안 작성",
+            ],
+            "example": "회의 녹취를 정리해 즉시 공유용 요약문으로 만드는 장면이 대표적임",
+        },
+        {
+            "title": "활용 효과를 수치로 보면 무엇이 보이는가",
+            "why": "도입 효과를 숫자로 보면 기대 수준과 적용 우선순위를 잡기 쉬움.",
+            "bullets": [
+                "초안 작성 시간 단축 효과가 가장 먼저 보임",
+                "검토와 수정 시간을 포함해도 전체 소요가 줄어듦",
+                "작은 업무부터 적용해도 체감 효과가 큼",
+            ],
+            "example": "주간 보고 작성 시간이 2시간에서 30분 수준으로 줄어드는 사례가 자주 나옴",
+        },
+        {
+            "title": "생성형 AI의 가장 큰 한계는 무엇인가",
+            "why": "효율만 강조하면 위험을 놓치기 때문에 한계도 함께 이해해야 함.",
+            "bullets": [
+                "그럴듯하지만 사실이 아닌 답을 만들 수 있음",
+                "항상 같은 방식으로 통제되지 않음",
+                "출력 품질이 질문 방식에 따라 크게 달라짐",
+                "검토 없이 바로 쓰면 오류 위험이 커짐",
+            ],
+            "example": "존재하지 않는 통계 수치를 자연스럽게 문장 안에 넣는 경우가 있음",
+        },
+        {
+            "title": "환각은 왜 발생하는가",
+            "why": "환각의 원리를 알아야 생성형 AI 답변을 안전하게 검토할 수 있음.",
+            "bullets": [
+                {"text": "환각은 정답 검색이 아니라 확률 기반 생성에서 발생함", "level": 0},
+                {"text": "그럴듯한 표현을 우선 이어 붙이는 성향이 있음", "level": 1},
+                {"text": "출처 검증 없이 문장을 완성하려는 경향이 있음", "level": 1},
+                {"text": "질문 맥락이 모호하면 오류 가능성이 더 커짐", "level": 1},
+            ],
+            "example": "없는 판례나 수치를 실제 사례처럼 말하는 장면이 대표적임",
+        },
+        {
+            "title": "통제가 어려운 이유는 무엇인가",
+            "why": "출력 통제의 어려움을 알아야 운영 기준과 검토 절차를 설계할 수 있음.",
+            "bullets": [
+                "같은 질문에도 표현과 결과가 달라질 수 있음",
+                "질문 조건이 조금만 달라도 답변 방향이 바뀜",
+                "모델 업데이트에 따라 출력 특성이 달라질 수 있음",
+                "그래서 최종 판단은 사람의 검토가 필요함",
+            ],
+            "example": "같은 요약 요청이라도 강조하는 포인트가 매번 조금씩 달라질 수 있음",
+        },
+        {
+            "title": "안전하게 쓰기 위한 운영 원칙",
+            "why": "업무에 적용하려면 활용 기준과 검토 절차를 함께 갖춰야 함.",
+            "bullets": [
+                "초안 작성과 최종 승인 역할을 분리함",
+                "출처 확인과 사실 검토 절차를 둠",
+                "민감 정보 입력 기준을 명확히 정함",
+                "결과물 품질 점검 기준을 함께 운영함",
+            ],
+            "example": "생성형 AI가 초안을 만들고 담당자가 근거와 표현을 검토하는 구조가 기본임",
+        },
+    ]
 
-        slides.append(slide)
+    for idx, slide in enumerate(content_slides, start=2):
+        slides.append(
+            {
+                "slide_number": idx,
+                "slide_role": "content",
+                "source_slide": 2,
+                "practice_prompt": "실무 상황을 기준으로 발표자가 바로 설명할 수 있는 질문 구조를 포함함",
+                "transition": "이 내용을 바탕으로 다음 장표의 활용 흐름을 자연스럽게 이어감",
+                "image_prompt": f"교육용 프레젠테이션 일러스트, {slide['title']} 내용을 설명하는 업무 장면, 깔끔한 벡터 스타일",
+                "visual_type": slide.get("visual_type", "bullets"),
+                **slide,
+            }
+        )
 
     slides.append(
         {
@@ -971,16 +1988,17 @@ def build_mock_plan() -> dict[str, Any]:
             "slide_role": "practice_problem",
             "source_slide": 2,
             "title": "실습 문제",
-            "why": "학습 내용을 문제로 바꿔야 개념 이해가 실제 설명 능력으로 전환됩니다.",
+            "why": "학습한 내용을 실제 업무 상황에 적용해 보는 단계가 필요함.",
             "bullets": [
-                "생성형 AI와 기존 자동화 차이 설명 문제임.",
-                "정의와 차이점, 업무 예시 포함 필요.",
-                "발표하듯 자연스럽게 답하는 것이 핵심임.",
+                "팀 회의 내용을 보고용 문서로 바꾸는 문제를 설계함",
+                "문제 정의, 요구사항, 출력 형식을 함께 제시함",
+                "프롬프트를 직접 구성해 결과 구조를 확인함",
             ],
-            "example": "문제 정의: 기존 자동화와 생성형 AI 자동화의 차이를 교육생에게 설명하는 슬라이드 원고를 작성하시오.",
-            "practice_prompt": "요구사항: 정의, 차이점, 실제 업무 사례를 포함하고 문장은 발표 가능한 길이로 작성하시오.",
-            "transition": "다음 장표에서는 이 문제의 기대 답안 구조를 확인합니다.",
-            "image_prompt": "실습 문제 슬라이드용 심플한 교육 아이콘, 문제 해결과 발표 준비를 상징하는 장면",
+            "example": "한 주간 회의 메모를 바탕으로 팀장 보고용 1페이지 초안을 만드는 과제임",
+            "practice_prompt": "회의 메모를 입력했을 때 요약, 핵심 이슈, 후속 액션을 포함한 초안이 나오도록 프롬프트를 설계함",
+            "transition": "이제 정답 구조 예시를 보면서 좋은 프롬프트의 기준을 정리함",
+            "image_prompt": "교육용 프레젠테이션 일러스트, 실습 문제를 수행하는 직장인과 노트북 화면, 깔끔한 벡터 스타일",
+            "visual_type": "bullets",
         }
     )
     slides.append(
@@ -989,16 +2007,17 @@ def build_mock_plan() -> dict[str, Any]:
             "slide_role": "practice_answer",
             "source_slide": 2,
             "title": "실습 문제 정답 예시",
-            "why": "기대 답안 구조를 먼저 보면 어떤 수준으로 답해야 하는지 기준이 분명해집니다.",
+            "why": "좋은 프롬프트와 출력 구조의 예시를 보여 주면 실습 기준이 더 분명해짐.",
             "bullets": [
-                "정답은 정의부터 차근히 설명하는 구조임.",
-                "차이점과 업무 예시를 함께 보여주는 답안임.",
-                "마지막에는 검토 필요성까지 포함함.",
+                "문제 정의, 요구사항, 출력 형식을 먼저 분리함",
+                "역할과 대상 독자를 함께 지정함",
+                "최종 결과 예시까지 포함해 품질 기준을 잡음",
             ],
-            "example": "정답 구조 예시: 1) 기존 자동화 정의 2) 생성형 AI 자동화 정의 3) 차이점 2가지 4) 보고서 작성 예시 5) 검토 필요성 정리",
-            "practice_prompt": "예시 답안: 기존 자동화는 규칙에 따라 같은 결과를 반복하지만, 생성형 AI 자동화는 자연어 요청에 따라 문맥에 맞는 초안을 생성합니다. 따라서 결과 활용 전 검토가 반드시 필요합니다.",
-            "transition": "이제 오늘 학습 내용을 마지막으로 한 번 더 정리합니다.",
-            "image_prompt": "교육용 정답 예시 슬라이드, 발표 구조와 체크포인트를 보여주는 프레젠테이션 스타일",
+            "example": "회의 결과를 5개 항목으로 정리하고, 후속 액션을 담당자 기준으로 분류하는 예시임",
+            "practice_prompt": "당신은 팀 회의 내용을 정리하는 업무 보조자임. 아래 메모를 팀장 보고용으로 요약하고 핵심 이슈 3개와 후속 조치 2개를 제시하라.",
+            "transition": "마지막으로 오늘 학습한 핵심 메시지를 다시 정리함",
+            "image_prompt": "교육용 프레젠테이션 일러스트, 좋은 프롬프트 예시와 출력 결과를 비교하는 장면, 깔끔한 벡터 스타일",
+            "visual_type": "bullets",
         }
     )
     slides.append(
@@ -1007,20 +2026,97 @@ def build_mock_plan() -> dict[str, Any]:
             "slide_role": "summary",
             "source_slide": 2,
             "title": "핵심 요약",
-            "why": "마지막 정리를 통해 오늘 배운 내용을 한 번에 회상할 수 있습니다.",
+            "why": "전체 흐름을 짧게 다시 정리해야 학습 내용이 구조적으로 남음.",
             "bullets": [
-                "생성형 AI는 새 내용을 만드는 기술임.",
-                "LLM은 그 중심에서 언어를 처리함.",
-                "업무 자동화 범위가 더 넓어지는 흐름임.",
-                "결과는 반드시 검토가 필요함.",
-                "좋은 프롬프트와 검증이 함께 필요함.",
+                "생성형 AI는 새로운 결과물을 만들어 내는 기술임",
+                "LLM은 문맥을 보고 가장 그럴듯한 표현을 생성함",
+                "기존 자동화와 달리 비정형 문서 업무까지 확장됨",
+                "활용 효과가 크지만 환각과 통제 한계도 분명함",
+                "안전한 활용을 위해서는 검토 절차가 반드시 필요함",
             ],
             "example": "",
             "practice_prompt": "",
             "transition": "",
-            "image_prompt": "강의 마무리 요약 인포그래픽, 핵심 포인트 5개를 정리한 프레젠테이션 스타일",
+            "image_prompt": "교육용 프레젠테이션 일러스트, 핵심 요약 5가지를 정리한 인포그래픽, 깔끔한 벡터 스타일",
+            "visual_type": "bullets",
         }
     )
+
+    mock_visual_overrides = {
+        4: {
+            "visual_type": "diagram",
+            "diagram": {
+                "diagram_type": "process",
+                "title": "LLM 답변 생성 흐름",
+                "nodes": ["질문 입력", "문맥 해석", "다음 표현 계산", "답변 생성"],
+                "links": [
+                    ["질문 입력", "문맥 해석"],
+                    ["문맥 해석", "다음 표현 계산"],
+                    ["다음 표현 계산", "답변 생성"],
+                ],
+                "notes": "입력부터 답변 생성까지의 흐름을 단계별로 설명함",
+            },
+        },
+        7: {
+            "visual_type": "diagram",
+            "diagram": {
+                "diagram_type": "comparison",
+                "title": "기존 자동화와 생성형 AI 비교",
+                "nodes": ["규칙 기반", "비교 포인트", "생성 기반"],
+                "links": [
+                    ["규칙 기반", "비교 포인트"],
+                    ["비교 포인트", "생성 기반"],
+                ],
+                "notes": "두 방식의 입력 조건과 결과 생성 차이를 비교함",
+            },
+        },
+        10: {
+            "visual_type": "table",
+            "table": {
+                "headers": ["항목", "기존 방식", "생성형 AI"],
+                "rows": [
+                    ["초안 작성", "직접 작성", "초안 자동 생성"],
+                    ["결과 설명", "수동 해석", "설명 문장 자동화"],
+                    ["문서 요약", "전체 읽기", "핵심 요약 제공"],
+                ],
+            },
+        },
+        13: {
+            "visual_type": "diagram",
+            "diagram": {
+                "diagram_type": "relationship",
+                "title": "사람과 AI의 역할 분담",
+                "nodes": ["업무 요청", "LLM", "초안 생성", "최종 검토"],
+                "links": [
+                    ["업무 요청", "LLM"],
+                    ["LLM", "초안 생성"],
+                    ["초안 생성", "최종 검토"],
+                ],
+                "notes": "AI는 초안을 만들고 사람은 판단과 검토를 담당함",
+            },
+        },
+        16: {
+            "visual_type": "diagram",
+            "diagram": {
+                "diagram_type": "cycle",
+                "title": "안전한 활용 반복 구조",
+                "nodes": ["질문 설계", "결과 생성", "사실 검토", "최종 반영"],
+                "links": [
+                    ["질문 설계", "결과 생성"],
+                    ["결과 생성", "사실 검토"],
+                    ["사실 검토", "최종 반영"],
+                    ["최종 반영", "질문 설계"],
+                ],
+                "notes": "생성 후 검토를 거쳐 다시 개선하는 반복 구조를 보여 줌",
+            },
+        },
+    }
+
+    for slide in slides:
+        slide.setdefault("visual_type", "bullets")
+        override = mock_visual_overrides.get(slide["slide_number"])
+        if override:
+            slide.update(override)
 
     return {
         "deck_title": "생성형 AI 개요 및 업무 변화 이해",
@@ -1033,12 +2129,12 @@ def normalize_slide_plan(plan: dict[str, Any], template_analysis: dict[str, Any]
     valid_source_slides = {
         item["source_slide"] for item in template_analysis["candidate_templates"]
     }
+    fallback_source_slide = int(template_analysis.get("content_template_slide", 1))
     for slide in plan["slides"]:
+        slide.setdefault("visual_type", "bullets")
         source_slide = slide.get("source_slide")
         if source_slide not in valid_source_slides:
-            raise ValueError(
-                f"LLM selected source_slide={source_slide}, which is not in template candidates."
-            )
+            slide["source_slide"] = fallback_source_slide
     return plan
 
 
@@ -1056,9 +2152,14 @@ def generate_slide_plan(
     return normalize_slide_plan(plan, template_analysis), raw_text
 
 
-def render_presentation(template_path: Path, plan: dict[str, Any], output_path: Path) -> None:
+def render_presentation(
+    template_path: Path,
+    plan: dict[str, Any],
+    output_path: Path,
+    lecture_title: str | None = None,
+) -> None:
     target_prs = Presentation(str(template_path))
-    section_label = plan.get("section_label", plan.get("deck_title", "강의안"))
+    section_label = resolve_section_label(plan, lecture_title)
 
     original_slide_count = len(target_prs.slides)
     generated_slides: list[tuple[Any, Any, dict[str, Any]]] = []
@@ -1081,9 +2182,10 @@ def render_presentation_with_images(
     output_path: Path,
     skip_images: bool,
     image_output_dir: Path,
+    lecture_title: str | None = None,
 ) -> None:
     target_prs = Presentation(str(template_path))
-    section_label = plan.get("section_label", plan.get("deck_title", "강의안"))
+    section_label = resolve_section_label(plan, lecture_title)
     total_slides = len(plan["slides"])
     client = None if skip_images else get_openai_client()
     original_slide_count = len(target_prs.slides)
@@ -1093,14 +2195,24 @@ def render_presentation_with_images(
         source_slide = target_prs.slides[slide_data["source_slide"] - 1]
         slide = clone_slide(target_prs, slide_data["source_slide"] - 1)
         fill_slide(slide, source_slide, slide_data, section_label)
+        if slide_data.get("visual_type") == "diagram" and slide_data.get("diagram"):
+            print(f"[{index}/{total_slides}] 다이어그램 렌더링 완료")
 
         image_prompt = (slide_data.get("image_prompt") or "").strip()
         cached_image_path = get_cached_image_path(image_output_dir, index)
+        target_image_size = get_target_image_size_for_slide(source_slide)
 
         if cached_image_path.exists():
-            replace_slide_image(slide, source_slide, cached_image_path)
-            print(f"[{index}/{total_slides}] 기존 이미지 재사용")
-            continue
+            if client and not image_matches_target_size(cached_image_path, target_image_size):
+                try:
+                    cached_image_path.unlink()
+                    print(f"[{index}/{total_slides}] 기존 정사각형 이미지 재생성 예정")
+                except OSError:
+                    pass
+            else:
+                replace_slide_image(slide, source_slide, cached_image_path)
+                print(f"[{index}/{total_slides}] 기존 이미지 재사용")
+                continue
 
         if image_prompt and client:
             print(f"[{index}/{total_slides}] 이미지 생성 중")
@@ -1110,6 +2222,7 @@ def render_presentation_with_images(
                     image_prompt=image_prompt,
                     output_dir=image_output_dir,
                     slide_number=index,
+                    image_size=target_image_size,
                 )
                 replace_slide_image(slide, source_slide, image_path)
                 print(f"[{index}/{total_slides}] 이미지 적용 완료")
@@ -1120,6 +2233,8 @@ def render_presentation_with_images(
 
     remove_slides_by_indices(target_prs, list(range(original_slide_count)))
     target_prs.save(str(output_path))
+
+
 
 
 def main() -> None:
@@ -1168,6 +2283,21 @@ def main() -> None:
 
     prompt_template = read_prompt_file(prompt_file)
     sessions = parse_curriculum_file(curriculum_path)
+    selected_lectures = parse_lecture_selection(args.lecture)
+    selected_pages = parse_page_selection(args.page)
+
+    if selected_pages and not selected_lectures:
+        raise ValueError("--page can only be used together with --lecture.")
+
+    if selected_lectures:
+        sessions = [
+            session for session in sessions if session["session_no"] in selected_lectures
+        ]
+        if not sessions:
+            selected_text = ", ".join(str(number) for number in sorted(selected_lectures))
+            raise ValueError(
+                f"No matching lectures were found in {curriculum_path} for: {selected_text}"
+            )
 
     if not sessions:
         try:
@@ -1187,6 +2317,7 @@ def main() -> None:
                 output_path=output_path,
                 skip_images=args.mock or args.skip_images or (not image_generation_enabled),
                 image_output_dir=build_image_output_dir_for_session(),
+                lecture_title=slide_plan.get("deck_title"),
             )
         except Exception as exc:
             error_text = (
@@ -1212,15 +2343,20 @@ def main() -> None:
     print(f"Curriculum sessions detected: {total_sessions}")
     continue_on_error = env_flag("CONTINUE_ON_SESSION_ERROR", True)
     generated_ppt_paths: list[Path] = []
+    page_suffix = format_page_suffix(selected_pages)
 
     for session_index, session in enumerate(sessions, start=1):
         session_slug = slugify_korean(session["title"])
         session_prefix = f"{session['session_no']:02d}_{session_slug}"
+        if selected_pages:
+            file_prefix = f"lecture{session['session_no']}{page_suffix}"
+        else:
+            file_prefix = session_prefix
         session_prompt_text = render_session_prompt(prompt_template, session)
-        session_prompt_path = OUTPUT_DIR / f"{session_prefix}_prompt.txt"
-        session_json_path = OUTPUT_DIR / f"{session_prefix}_slide_plan.json"
-        session_raw_path = OUTPUT_DIR / f"{session_prefix}_llm_raw_response.txt"
-        session_ppt_path = OUTPUT_DIR / f"{session_prefix}.pptx"
+        session_prompt_path = OUTPUT_DIR / f"{file_prefix}_prompt.txt"
+        session_json_path = OUTPUT_DIR / f"{file_prefix}_slide_plan.json"
+        session_raw_path = OUTPUT_DIR / f"{file_prefix}_llm_raw_response.txt"
+        session_ppt_path = OUTPUT_DIR / f"{file_prefix}.pptx"
 
         print(
             f"[교시 {session_index}/{total_sessions}] 생성 시작: {session['session_no']}교시 {session['title']}"
@@ -1232,6 +2368,7 @@ def main() -> None:
             slide_plan, raw_response_text = generate_slide_plan(
                 session_prompt_text, template_analysis, args.model, args.mock
             )
+            slide_plan = filter_slide_plan_pages(slide_plan, selected_pages)
 
             session_json_path.write_text(
                 json.dumps(slide_plan, ensure_ascii=False, indent=2),
@@ -1245,7 +2382,8 @@ def main() -> None:
                 plan=slide_plan,
                 output_path=session_ppt_path,
                 skip_images=args.mock or args.skip_images or (not image_generation_enabled),
-                image_output_dir=build_image_output_dir_for_session(session_prefix),
+                image_output_dir=build_image_output_dir_for_session(file_prefix),
+                lecture_title=session["title"],
             )
 
             generated_ppt_paths.append(session_ppt_path)
@@ -1258,14 +2396,14 @@ def main() -> None:
                 f"오류 메시지: {exc}\n\n"
                 f"{traceback.format_exc()}"
             )
-            error_file = write_session_error_file(session_prefix, error_text)
+            error_file = write_session_error_file(file_prefix, error_text)
             append_error_log(error_text)
             print(f"[교시 {session_index}/{total_sessions}] 실패: {error_file}")
             if not continue_on_error:
                 raise
 
     merged_output_path = build_merged_output_path()
-    if generated_ppt_paths:
+    if generated_ppt_paths and not selected_lectures:
         print(f"[병합] 교시별 PPT {len(generated_ppt_paths)}개를 하나로 병합 중")
         merge_presentations(generated_ppt_paths, merged_output_path)
         print(f"[병합] 완료: {merged_output_path}")
