@@ -1,6 +1,7 @@
-﻿param(
+param(
     [switch]$AnalyzeOnly,
     [switch]$Mock,
+    [switch]$GoogleSafe,
     [string]$PromptFile,
     [string]$TemplateFile,
     [string]$Model,
@@ -18,7 +19,7 @@ trap [System.Management.Automation.PipelineStoppedException] {
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvPath = Join-Path $ProjectRoot ".venv"
-$PythonExe = Join-Path $VenvPath "Scripts\python.exe"
+$PythonExe = Join-Path $VenvPath "Scripts\\python.exe"
 $RequirementsFile = Join-Path $ProjectRoot "requirements.txt"
 $AppFile = Join-Path $ProjectRoot "app.py"
 $TempPath = Join-Path $ProjectRoot ".tmp"
@@ -120,6 +121,10 @@ if ($AnalyzeOnly) {
 
 if ($Mock) {
     $ArgsList += "--mock"
+}
+
+if ($GoogleSafe) {
+    $ArgsList += "--google-safe"
 }
 
 if ($PromptFile) {

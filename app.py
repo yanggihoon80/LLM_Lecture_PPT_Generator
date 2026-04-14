@@ -29,6 +29,7 @@ TEMPLATE_DIR = BASE_DIR / "template"
 PROMPTS_DIR = BASE_DIR / "prompts"
 OUTPUT_DIR = BASE_DIR / "output"
 IMAGES_DIR = OUTPUT_DIR / "images"
+GOOGLE_SAFE_MODE = True
 
 DEFAULT_PROMPT_FILE = PROMPTS_DIR / "lecture_prompt.txt"
 DEFAULT_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.txt"
@@ -181,6 +182,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip image generation and keep the template image as-is. Overrides .env setting.",
     )
+    parser.add_argument(
+        "--google-safe",
+        action="store_true",
+        help="Generate a simpler PPTX for better Google Slides import compatibility.",
+    )
     return parser.parse_args()
 
 
@@ -221,6 +227,29 @@ def build_analysis_output_path() -> Path:
 
 def build_raw_output_path() -> Path:
     return OUTPUT_DIR / "llm_raw_response.txt"
+
+
+def build_session_plan_path(session_prefix: str) -> Path:
+    return OUTPUT_DIR / f"{session_prefix}_slide_plan.json"
+
+
+def build_session_raw_path(session_prefix: str) -> Path:
+    return OUTPUT_DIR / f"{session_prefix}_llm_raw_response.txt"
+
+
+def load_cached_slide_plan(
+    json_path: Path, raw_path: Path
+) -> tuple[dict[str, Any] | None, str]:
+    if not json_path.exists():
+        return None, ""
+
+    try:
+        plan = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None, ""
+
+    raw_text = raw_path.read_text(encoding="utf-8") if raw_path.exists() else ""
+    return plan, raw_text
 
 
 def build_image_output_dir() -> Path:
@@ -272,7 +301,13 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
         return []
 
     lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
-    header_pattern = re.compile(r".*?(\d+)교시\.\s*(.+)")
+    header_pattern = re.compile(r".*?(\d+)교시\s*[\.:：]?\s*(.+)")
+    labeled_meta_pattern = re.compile(
+        r"^\s*(메모|참고|실습|주의|비고|목표|준비물|과제)\s*[:：]\s*(.+)$"
+    )
+    bracket_meta_pattern = re.compile(
+        r"^\s*\[(메모|참고|실습|주의|비고|목표|준비물|과제)\]\s*(.+)$"
+    )
 
     sessions: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
@@ -310,7 +345,26 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
             pending_label = None
             continue
 
-        current["core_points"].append(line)
+        labeled_meta_match = labeled_meta_pattern.match(line)
+        if labeled_meta_match:
+            label = labeled_meta_match.group(1).strip()
+            value = labeled_meta_match.group(2).strip()
+            if value:
+                current["meta"].setdefault(label, []).append(value)
+            continue
+
+        bracket_meta_match = bracket_meta_pattern.match(line)
+        if bracket_meta_match:
+            label = bracket_meta_match.group(1).strip()
+            value = bracket_meta_match.group(2).strip()
+            if value:
+                current["meta"].setdefault(label, []).append(value)
+            continue
+
+        normalized_line = re.sub(r"^\s*[-•·●▪◦]\s*", "", line).strip()
+        normalized_line = re.sub(r"^\s*\d+[\.\)]\s*", "", normalized_line).strip()
+        if normalized_line:
+            current["core_points"].append(normalized_line)
 
     if current:
         sessions.append(current)
@@ -498,6 +552,14 @@ def set_text(shape, text: str) -> None:
     text_frame.paragraphs[0].text = text
 
 
+def normalize_paragraph_layout(paragraph, *, align=PP_ALIGN.LEFT) -> None:
+    paragraph.alignment = align
+    paragraph.left_indent = Pt(0)
+    paragraph.first_line_indent = Pt(0)
+    paragraph.space_before = Pt(0)
+    paragraph.space_after = Pt(0)
+
+
 def set_paragraphs(shape, lines: list[Any]) -> None:
     if not getattr(shape, "has_text_frame", False):
         return
@@ -505,6 +567,7 @@ def set_paragraphs(shape, lines: list[Any]) -> None:
     cleaned = [line for line in lines if line]
     text_frame = shape.text_frame
     text_frame.clear()
+    text_frame.word_wrap = True
 
     if not cleaned:
         text_frame.paragraphs[0].text = ""
@@ -524,12 +587,25 @@ def set_paragraphs(shape, lines: list[Any]) -> None:
             continue
 
         paragraph = text_frame.paragraphs[0] if idx == 0 else text_frame.add_paragraph()
-        paragraph.text = line
-        paragraph.level = max(0, level)
-        if use_bullet:
-            apply_bullet_to_paragraph(paragraph)
-        else:
+        normalize_paragraph_layout(paragraph, align=PP_ALIGN.LEFT)
+        if GOOGLE_SAFE_MODE:
+            indent = "    " * max(0, level)
+            paragraph.level = 0
+            paragraph.text = ""
             remove_bullet_from_paragraph(paragraph)
+            prefix = f"{indent}• " if use_bullet else indent
+            run = paragraph.add_run()
+            if use_bullet:
+                run.text = f"{prefix}{line}"
+            else:
+                run.text = f"{prefix}{line}"
+        else:
+            paragraph.text = line
+            paragraph.level = max(0, level)
+            if use_bullet:
+                apply_bullet_to_paragraph(paragraph)
+            else:
+                remove_bullet_from_paragraph(paragraph)
 
 
 def apply_bullet_to_paragraph(paragraph) -> None:
@@ -570,6 +646,7 @@ def apply_font_style(shape, font_name: str, font_size: int, bold: bool | None = 
         for run in paragraph.runs:
             run.font.name = font_name
             run.font.size = Pt(font_size)
+            run.font.color.rgb = RGBColor(34, 34, 34)
             if bold is not None:
                 run.font.bold = bold
 
@@ -578,8 +655,30 @@ def apply_default_text_style(shape, font_name: str, font_size: int = 20) -> None
     apply_font_style(shape, font_name=font_name, font_size=font_size, bold=None)
 
 
-def apply_title_style(shape, font_name: str) -> None:
+def apply_section_label_style(shape, font_name: str) -> None:
     apply_font_style(shape, font_name=font_name, font_size=20, bold=True)
+    if not getattr(shape, "has_text_frame", False):
+        return
+    shape.text_frame.word_wrap = True
+    shape.text_frame.vertical_anchor = MSO_VERTICAL_ANCHOR.TOP
+    shape.text_frame.margin_top = Pt(0)
+    shape.text_frame.margin_bottom = Pt(0)
+    for paragraph in shape.text_frame.paragraphs:
+        normalize_paragraph_layout(paragraph, align=PP_ALIGN.CENTER)
+        paragraph.line_spacing = 1.0
+
+
+def apply_slide_title_style(shape, font_name: str) -> None:
+    apply_font_style(shape, font_name=font_name, font_size=20, bold=True)
+    if not getattr(shape, "has_text_frame", False):
+        return
+    shape.text_frame.word_wrap = True
+    shape.text_frame.vertical_anchor = MSO_VERTICAL_ANCHOR.TOP
+    shape.text_frame.margin_top = Pt(0)
+    shape.text_frame.margin_bottom = Pt(0)
+    for paragraph in shape.text_frame.paragraphs:
+        normalize_paragraph_layout(paragraph, align=PP_ALIGN.LEFT)
+        paragraph.line_spacing = 1.0
 
 
 def iter_text_shapes(slide) -> list[Any]:
@@ -728,8 +827,9 @@ def apply_table_cell_style(cell) -> None:
             run.font.name = "맑은 고딕"
             run.font.size = Pt(11)
 
-    for side in ("lnL", "lnR", "lnT", "lnB"):
-        set_cell_border(cell, side)
+    if not GOOGLE_SAFE_MODE:
+        for side in ("lnL", "lnR", "lnT", "lnB"):
+            set_cell_border(cell, side)
 
 
 def get_first_table_spec(slide) -> dict[str, Any] | None:
@@ -1418,6 +1518,9 @@ def build_presenter_notes(slide_data: dict[str, Any]) -> list[str]:
 
 
 def set_presenter_notes(slide, slide_data: dict[str, Any], font_name: str) -> None:
+    if GOOGLE_SAFE_MODE:
+        return
+
     notes_slide = slide.notes_slide
     note_lines = build_presenter_notes(slide_data)
     if not note_lines:
@@ -1447,8 +1550,8 @@ def fill_slide(slide, source_slide, slide_data: dict[str, Any], section_label: s
 
     set_text(text_shapes[0], section_label)
     set_text(text_shapes[1], slide_data["title"])
-    apply_title_style(text_shapes[0], font_name=font_name)
-    apply_title_style(text_shapes[1], font_name=font_name)
+    apply_section_label_style(text_shapes[0], font_name=font_name)
+    apply_slide_title_style(text_shapes[1], font_name=font_name)
 
     main_lines = format_main_body(slide_data)
     if slide_role in {"objective", "content", "summary"}:
@@ -1470,21 +1573,40 @@ def fill_slide(slide, source_slide, slide_data: dict[str, Any], section_label: s
         render_diagram(slide, source_slide, slide_data, slide_data["diagram"])
 
 
+class LLMJSONParseError(RuntimeError):
+    def __init__(self, message: str, raw_text: str):
+        super().__init__(message)
+        self.raw_text = raw_text
+
+
 def extract_json_block(text: str) -> dict[str, Any]:
+    def decode_or_raise(candidate: str, label: str) -> dict[str, Any]:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            lines = candidate.splitlines()
+            error_line = lines[exc.lineno - 1] if 0 < exc.lineno <= len(lines) else ""
+            pointer = " " * max(exc.colno - 1, 0) + "^"
+            message = (
+                f"{label} JSON parse failed at line {exc.lineno}, column {exc.colno}: {exc.msg}\n"
+                f"{error_line}\n{pointer}"
+            )
+            raise LLMJSONParseError(message, text) from exc
+
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+        return decode_or_raise(text, "full response")
+    except LLMJSONParseError:
         pass
 
     fenced = re.search(r"```json\s*(\{.*\})\s*```", text, re.DOTALL)
     if fenced:
-        return json.loads(fenced.group(1))
+        return decode_or_raise(fenced.group(1), "fenced block")
 
     bare = re.search(r"(\{.*\})", text, re.DOTALL)
     if bare:
-        return json.loads(bare.group(1))
+        return decode_or_raise(bare.group(1), "bare block")
 
-    raise ValueError("LLM response did not contain valid JSON.")
+    raise LLMJSONParseError("LLM response did not contain valid JSON.", text)
 
 
 def build_llm_prompt(prompt_text: str, template_analysis: dict[str, Any]) -> str:
@@ -1545,7 +1667,10 @@ def generate_slide_plan_with_llm(
     )
 
     raw_text = response.output_text
-    return extract_json_block(raw_text), raw_text
+    try:
+        return extract_json_block(raw_text), raw_text
+    except LLMJSONParseError as exc:
+        raise LLMJSONParseError(str(exc), raw_text) from exc
 
 
 def generate_slide_image(
@@ -2238,9 +2363,11 @@ def render_presentation_with_images(
 
 
 def main() -> None:
+    global GOOGLE_SAFE_MODE
     load_env_file(DEFAULT_ENV_FILE)
     ensure_dirs()
     args = parse_args()
+    GOOGLE_SAFE_MODE = True
     image_generation_enabled = env_flag("OPENAI_ENABLE_IMAGE_GENERATION", False)
 
     template_path = (
@@ -2301,16 +2428,25 @@ def main() -> None:
 
     if not sessions:
         try:
-            print("[단일 작업] LLM 호출 시작")
-            slide_plan, raw_response_text = generate_slide_plan(
-                prompt_template, template_analysis, args.model, args.mock
+            cached_plan, cached_raw_text = load_cached_slide_plan(
+                json_output_path, raw_output_path
             )
+            if cached_plan is not None:
+                print("[단일 작업] 기존 slide_plan 재사용")
+                slide_plan = cached_plan
+                raw_response_text = cached_raw_text
+            else:
+                print("[단일 작업] LLM 호출 시작")
+                slide_plan, raw_response_text = generate_slide_plan(
+                    prompt_template, template_analysis, args.model, args.mock
+                )
 
             json_output_path.write_text(
                 json.dumps(slide_plan, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            raw_output_path.write_text(raw_response_text, encoding="utf-8")
+            if raw_response_text:
+                raw_output_path.write_text(raw_response_text, encoding="utf-8")
             render_presentation_with_images(
                 template_path=template_path,
                 plan=slide_plan,
@@ -2357,6 +2493,8 @@ def main() -> None:
         session_json_path = OUTPUT_DIR / f"{file_prefix}_slide_plan.json"
         session_raw_path = OUTPUT_DIR / f"{file_prefix}_llm_raw_response.txt"
         session_ppt_path = OUTPUT_DIR / f"{file_prefix}.pptx"
+        full_session_json_path = build_session_plan_path(session_prefix)
+        full_session_raw_path = build_session_raw_path(session_prefix)
 
         print(
             f"[교시 {session_index}/{total_sessions}] 생성 시작: {session['session_no']}교시 {session['title']}"
@@ -2364,17 +2502,35 @@ def main() -> None:
         session_prompt_path.write_text(session_prompt_text, encoding="utf-8")
 
         try:
-            print(f"[교시 {session_index}/{total_sessions}] LLM 호출 시작")
-            slide_plan, raw_response_text = generate_slide_plan(
-                session_prompt_text, template_analysis, args.model, args.mock
+            cached_plan, cached_raw_text = load_cached_slide_plan(
+                full_session_json_path, full_session_raw_path
             )
+            if cached_plan is not None:
+                print(
+                    f"[교시 {session_index}/{total_sessions}] 기존 slide_plan 재사용: {full_session_json_path}"
+                )
+                slide_plan = cached_plan
+                raw_response_text = cached_raw_text
+            else:
+                print(f"[교시 {session_index}/{total_sessions}] LLM 호출 시작")
+                slide_plan, raw_response_text = generate_slide_plan(
+                    session_prompt_text, template_analysis, args.model, args.mock
+                )
+
+            full_slide_plan = slide_plan
             slide_plan = filter_slide_plan_pages(slide_plan, selected_pages)
 
             session_json_path.write_text(
                 json.dumps(slide_plan, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            session_raw_path.write_text(raw_response_text, encoding="utf-8")
+            if raw_response_text:
+                session_raw_path.write_text(raw_response_text, encoding="utf-8")
+                full_session_raw_path.write_text(raw_response_text, encoding="utf-8")
+            full_session_json_path.write_text(
+                json.dumps(full_slide_plan, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
             print(f"[교시 {session_index}/{total_sessions}] PPT 렌더링 시작")
             render_presentation_with_images(
@@ -2389,6 +2545,9 @@ def main() -> None:
             generated_ppt_paths.append(session_ppt_path)
             print(f"[교시 {session_index}/{total_sessions}] 완료: {session_ppt_path}")
         except Exception as exc:
+            raw_text = getattr(exc, "raw_text", None)
+            if raw_text:
+                session_raw_path.write_text(raw_text, encoding="utf-8")
             error_text = (
                 f"[교시 {session_index}/{total_sessions}] 실패\n"
                 f"교시: {session['session_no']}교시 {session['title']}\n"
