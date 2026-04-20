@@ -33,6 +33,8 @@ GOOGLE_SAFE_MODE = True
 
 DEFAULT_PROMPT_FILE = PROMPTS_DIR / "lecture_prompt.txt"
 DEFAULT_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.txt"
+DIAGRAM_FILL_RGB = RGBColor(157, 195, 230)  # #9DC3E6
+DIAGRAM_LINE_RGB = RGBColor(91, 155, 213)
 DEFAULT_ENV_FILE = BASE_DIR / ".env"
 
 
@@ -784,9 +786,10 @@ def fill_table(shape, table_data: dict[str, Any]) -> None:
         for col_idx, cell in enumerate(row[: len(table.columns)]):
             table.cell(row_idx, col_idx).text = str(cell)
 
-    for row in table.rows:
+    for row_idx, row in enumerate(table.rows):
+        is_header = row_idx == 0
         for cell in row.cells:
-            apply_table_cell_style(cell)
+            apply_table_cell_style(cell, is_header=is_header)
 
 
 def set_cell_border(cell, side: str, color: str = "4C72B0", width: int = 12700) -> None:
@@ -818,14 +821,16 @@ def set_cell_border(cell, side: str, color: str = "4C72B0", width: int = 12700) 
     prst_dash.set("val", "solid")
 
 
-def apply_table_cell_style(cell) -> None:
+def apply_table_cell_style(cell, is_header: bool = False) -> None:
     for paragraph in cell.text_frame.paragraphs:
         paragraph.font.name = "맑은 고딕"
         paragraph.font.size = Pt(11)
         paragraph.line_spacing = 1.2
+        paragraph.alignment = PP_ALIGN.CENTER if is_header else PP_ALIGN.LEFT
         for run in paragraph.runs:
             run.font.name = "맑은 고딕"
             run.font.size = Pt(11)
+            run.font.bold = is_header
 
     if not GOOGLE_SAFE_MODE:
         for side in ("lnL", "lnR", "lnT", "lnB"):
@@ -1092,8 +1097,8 @@ def add_diagram_shape(
         height,
     )
     shape.fill.solid()
-    shape.fill.fore_color.rgb = RGBColor(241, 246, 255)
-    shape.line.color.rgb = RGBColor(76, 114, 176)
+    shape.fill.fore_color.rgb = DIAGRAM_FILL_RGB
+    shape.line.color.rgb = DIAGRAM_LINE_RGB
     shape.line.width = 1
     set_text(shape, text)
     shape.text_frame.word_wrap = True
@@ -1307,7 +1312,7 @@ def add_connector_line(
         connector_type = MSO_CONNECTOR.STRAIGHT
 
     connector = slide.shapes.add_connector(connector_type, x1, y1, x2, y2)
-    connector.line.color.rgb = RGBColor(76, 114, 176)
+    connector.line.color.rgb = DIAGRAM_LINE_RGB
     connector.line.width = Pt(1.8 if diagram_type == "process" else 1.4)
 
 
@@ -1315,7 +1320,7 @@ def add_plain_line(
     slide, x1: int, y1: int, x2: int, y2: int, width_pt: float = 1.25, arrow_end: bool = False
 ):
     connector = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, x1, y1, x2, y2)
-    connector.line.color.rgb = RGBColor(76, 114, 176)
+    connector.line.color.rgb = DIAGRAM_LINE_RGB
     connector.line.width = Pt(width_pt)
     return connector
 
@@ -1458,6 +1463,9 @@ def format_main_body(slide_data: dict[str, Any]) -> list[dict[str, Any]]:
     for bullet in bullets:
         entry = parse_body_entry(bullet)
         if entry:
+            # Keep the body content as plain lines so PowerPoint does not render
+            # literal bullet glyphs when template/style handling varies.
+            entry["bullet"] = False
             normalized.append(entry)
 
     example_text = str(slide_data.get("example") or "").strip()
