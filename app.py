@@ -30,6 +30,8 @@ PROMPTS_DIR = BASE_DIR / "prompts"
 OUTPUT_DIR = BASE_DIR / "output"
 IMAGES_DIR = OUTPUT_DIR / "images"
 GOOGLE_SAFE_MODE = True
+LANDSCAPE_IMAGE_SAFE_MARGIN_RATIO = 0.08
+LANDSCAPE_IMAGE_LEFT_SAFE_MARGIN_RATIO = 0.14
 
 DEFAULT_PROMPT_FILE = PROMPTS_DIR / "lecture_prompt.txt"
 DEFAULT_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.txt"
@@ -1695,7 +1697,7 @@ def generate_slide_image(
         size=image_size,
     )
 
-    image_path = output_dir / f"slide_{slide_number:02d}.png"
+    image_path = get_cached_image_path(output_dir, slide_number)
     image_base64 = None
     if getattr(result, "data", None):
         item = result.data[0]
@@ -1705,11 +1707,12 @@ def generate_slide_image(
         raise ValueError("Image generation response did not include b64_json data.")
 
     image_path.write_bytes(base64.b64decode(image_base64))
+    add_landscape_safe_margins(image_path)
     return image_path
 
 
 def get_cached_image_path(output_dir: Path, slide_number: int) -> Path:
-    return output_dir / f"slide_{slide_number:02d}.png"
+    return output_dir / f"slide_{slide_number:02d}_safe.png"
 
 
 def enhance_image_prompt(image_prompt: str) -> str:
@@ -1719,10 +1722,46 @@ def enhance_image_prompt(image_prompt: str) -> str:
 
     safety_suffix = (
         " wide horizontal composition, landscape illustration, centered subject, "
+        "leave generous empty padding on the left and right edges, keep all important subjects "
+        "inside the central 70 percent of the image, no objects touching the left border, "
         "safe margins on all sides, no cropped head or hands, no important details near edges, "
         "no embedded text, no letters, no words, no labels"
     )
     return f"{base_prompt}, {safety_suffix}"
+
+
+def add_landscape_safe_margins(image_path: Path) -> None:
+    try:
+        with Image.open(image_path) as img:
+            original = img.convert("RGBA")
+    except Exception:
+        return
+
+    width, height = original.size
+    if width <= height or width <= 0 or height <= 0:
+        return
+
+    left_margin = int(round(width * LANDSCAPE_IMAGE_LEFT_SAFE_MARGIN_RATIO))
+    right_margin = int(round(width * LANDSCAPE_IMAGE_SAFE_MARGIN_RATIO))
+    vertical_margin = int(round(height * LANDSCAPE_IMAGE_SAFE_MARGIN_RATIO))
+    content_width = max(1, width - left_margin - right_margin)
+    content_height = max(1, height - (vertical_margin * 2))
+
+    image_ratio = width / height
+    box_ratio = content_width / content_height
+    if image_ratio >= box_ratio:
+        resized_width = content_width
+        resized_height = max(1, int(round(content_width / image_ratio)))
+    else:
+        resized_height = content_height
+        resized_width = max(1, int(round(content_height * image_ratio)))
+
+    resized = original.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+    paste_left = left_margin + max(0, (content_width - resized_width) // 2)
+    paste_top = vertical_margin + max(0, (content_height - resized_height) // 2)
+    canvas.alpha_composite(resized, (paste_left, paste_top))
+    canvas.convert("RGB").save(image_path)
 
 
 def get_target_image_size_for_slide(source_slide) -> str:
