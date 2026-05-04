@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import locale
 import math
@@ -233,6 +234,10 @@ def build_raw_output_path() -> Path:
     return OUTPUT_DIR / "llm_raw_response.txt"
 
 
+def build_slide_plan_meta_path() -> Path:
+    return OUTPUT_DIR / "generated_slide_plan.meta.json"
+
+
 def build_session_plan_path(session_prefix: str) -> Path:
     return OUTPUT_DIR / f"{session_prefix}_slide_plan.json"
 
@@ -241,11 +246,41 @@ def build_session_raw_path(session_prefix: str) -> Path:
     return OUTPUT_DIR / f"{session_prefix}_llm_raw_response.txt"
 
 
+def build_session_plan_meta_path(session_prefix: str) -> Path:
+    return OUTPUT_DIR / f"{session_prefix}_slide_plan.meta.json"
+
+
+def build_slide_plan_cache_key(prompt_text: str, model: str, use_mock: bool) -> str:
+    payload = json.dumps(
+        {
+            "prompt_text": prompt_text,
+            "model": model,
+            "mock": use_mock,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def load_cached_slide_plan(
-    json_path: Path, raw_path: Path
+    json_path: Path,
+    raw_path: Path,
+    cache_key: str | None = None,
+    meta_path: Path | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     if not json_path.exists():
         return None, ""
+
+    if cache_key:
+        if meta_path is None or not meta_path.exists():
+            return None, ""
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None, ""
+        if meta.get("cache_key") != cache_key:
+            return None, ""
 
     try:
         plan = json.loads(json_path.read_text(encoding="utf-8"))
@@ -254,6 +289,13 @@ def load_cached_slide_plan(
 
     raw_text = raw_path.read_text(encoding="utf-8") if raw_path.exists() else ""
     return plan, raw_text
+
+
+def write_slide_plan_cache_meta(meta_path: Path, cache_key: str) -> None:
+    meta_path.write_text(
+        json.dumps({"cache_key": cache_key}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def build_image_output_dir() -> Path:
@@ -1749,7 +1791,7 @@ def generate_slide_image(
         size=image_size,
     )
 
-    image_path = get_cached_image_path(output_dir, slide_number)
+    image_path = get_cached_image_path(output_dir, slide_number, image_prompt)
     image_base64 = None
     if getattr(result, "data", None):
         item = result.data[0]
@@ -1763,7 +1805,13 @@ def generate_slide_image(
     return image_path
 
 
-def get_cached_image_path(output_dir: Path, slide_number: int) -> Path:
+def get_cached_image_path(
+    output_dir: Path, slide_number: int, image_prompt: str | None = None
+) -> Path:
+    prompt_text = (image_prompt or "").strip()
+    if prompt_text:
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:10]
+        return output_dir / f"slide_{slide_number:02d}_{prompt_hash}_safe.png"
     return output_dir / f"slide_{slide_number:02d}_safe.png"
 
 
@@ -1982,6 +2030,156 @@ def merge_presentations(ppt_paths: list[Path], output_path: Path) -> None:
         )
         write_merge_error_file(error_text)
         raise RuntimeError(error_text)
+
+
+def extract_prompt_topic_and_core(prompt_text: str) -> tuple[str, list[str], list[str]]:
+    topic = "강의 주제"
+    topic_match = re.search(r"^주제:\s*(.+)$", prompt_text, re.MULTILINE)
+    if topic_match:
+        topic = topic_match.group(1).strip()
+
+    core_points: list[str] = []
+    core_match = re.search(
+        r"\[핵심 내용\]\s*(.*?)(?=\n\[[^\]]+\]|\Z)",
+        prompt_text,
+        re.DOTALL,
+    )
+    if core_match:
+        for line in core_match.group(1).splitlines():
+            normalized = re.sub(r"^\s*[-•·●▪◦]\s*", "", line).strip()
+            if normalized:
+                core_points.append(normalized)
+
+    context_points: list[str] = []
+    context_match = re.search(
+        r"\[추가 맥락\]\s*(.*?)(?=\n\[[^\]]+\]|\Z)",
+        prompt_text,
+        re.DOTALL,
+    )
+    if context_match:
+        for line in context_match.group(1).splitlines():
+            normalized = re.sub(r"^\s*[-•·●▪◦]\s*", "", line).strip()
+            if normalized:
+                context_points.append(normalized)
+
+    return topic, core_points, context_points
+
+
+def make_mock_slide_title(point: str, fallback: str) -> str:
+    cleaned = re.sub(r"^[^:：]+[:：]\s*", "", point).strip()
+    cleaned = re.sub(r"[“”\"']", "", cleaned)
+    cleaned = re.split(r"[\.。]| vs | → ", cleaned)[0].strip()
+    return cleaned[:28] or fallback
+
+
+def build_prompt_based_mock_plan(prompt_text: str) -> dict[str, Any]:
+    topic, core_points, context_points = extract_prompt_topic_and_core(prompt_text)
+    source_points = core_points + context_points
+    if not source_points:
+        source_points = [topic]
+
+    slides: list[dict[str, Any]] = [
+        {
+            "slide_number": 1,
+            "slide_role": "objective",
+            "source_slide": 2,
+            "title": "학습 목표",
+            "why": f"{topic}의 핵심 흐름을 먼저 정리해야 이후 실습과 적용이 쉬움.",
+            "bullets": [
+                f"{topic}의 기본 개념을 이해함",
+                "핵심 구조와 판단 기준을 구분함",
+                "실무 적용 포인트를 예시로 확인함",
+                "마지막 실습으로 내용을 정리함",
+            ],
+            "example": "",
+            "practice_prompt": "",
+            "transition": "먼저 전체 개념과 구조를 확인함",
+            "image_prompt": f"교육용 프레젠테이션 일러스트, {topic} 학습 목표를 정리한 장면, 깔끔한 인포그래픽 스타일",
+            "visual_type": "bullets",
+        }
+    ]
+
+    for slide_number in range(2, 18):
+        point = source_points[(slide_number - 2) % len(source_points)]
+        title = make_mock_slide_title(point, f"{topic} 핵심 {slide_number - 1}")
+        slides.append(
+            {
+                "slide_number": slide_number,
+                "slide_role": "content",
+                "source_slide": 2,
+                "title": title,
+                "why": f"{topic}를 이해하려면 이 항목의 의미와 활용 방식을 구분해야 함.",
+                "bullets": [
+                    point,
+                    f"{topic} 관점에서 핵심 의미를 정리함",
+                    "실무 판단 기준과 연결해 해석함",
+                    "다음 단계에서 적용할 질문으로 전환함",
+                ],
+                "example": f"{topic} 상황에서 이 항목을 기준으로 설명하거나 비교함",
+                "practice_prompt": "",
+                "transition": "이 내용을 바탕으로 다음 항목의 연결 구조를 확인함",
+                "image_prompt": f"교육용 프레젠테이션 일러스트, {title} 내용을 설명하는 업무 장면, 깔끔한 벡터 스타일",
+                "visual_type": "bullets",
+            }
+        )
+
+    slides.extend(
+        [
+            {
+                "slide_number": 18,
+                "slide_role": "practice_problem",
+                "source_slide": 2,
+                "title": "실습 문제",
+                "why": "학습 내용을 실제 업무 상황에 적용하는 단계가 필요함.",
+                "bullets": [
+                    f"{topic}와 관련된 업무 상황을 하나 선택함",
+                    "핵심 문제와 판단 기준을 문장으로 정리함",
+                    "필요한 데이터나 질문을 함께 작성함",
+                ],
+                "example": "",
+                "practice_prompt": f"{topic} 주제에 맞는 업무 상황을 입력하고 핵심 문제, 판단 기준, 다음 질문을 도출하라.",
+                "transition": "다음 장표에서 정답 구조 예시를 확인함",
+                "image_prompt": f"교육용 프레젠테이션 일러스트, {topic} 실습 문제를 수행하는 장면, 깔끔한 벡터 스타일",
+                "visual_type": "bullets",
+            },
+            {
+                "slide_number": 19,
+                "slide_role": "practice_answer",
+                "source_slide": 2,
+                "title": "실습 문제 정답 예시",
+                "why": "정답 구조를 보면 실습 결과를 더 쉽게 점검할 수 있음.",
+                "bullets": [
+                    "문제 정의를 한 문장으로 먼저 제시함",
+                    "판단 기준과 필요한 데이터를 분리함",
+                    "다음 실행 질문을 구체적으로 작성함",
+                ],
+                "example": f"{topic} 상황에서 문제, 기준, 데이터, 실행 질문 순서로 정리함",
+                "practice_prompt": "",
+                "transition": "마지막으로 전체 핵심을 요약함",
+                "image_prompt": f"교육용 프레젠테이션 일러스트, {topic} 정답 구조 예시를 정리한 장면, 깔끔한 벡터 스타일",
+                "visual_type": "bullets",
+            },
+            {
+                "slide_number": 20,
+                "slide_role": "summary",
+                "source_slide": 2,
+                "title": "핵심 요약",
+                "why": "마지막에 핵심 흐름을 다시 묶어야 학습 내용이 남음.",
+                "bullets": (core_points[:4] or source_points[:4]) + [f"{topic}는 구조화된 질문과 판단 기준이 중요함"],
+                "example": "",
+                "practice_prompt": "",
+                "transition": "",
+                "image_prompt": f"교육용 프레젠테이션 일러스트, {topic} 핵심 요약 인포그래픽, 깔끔한 벡터 스타일",
+                "visual_type": "bullets",
+            },
+        ]
+    )
+
+    return {
+        "deck_title": topic,
+        "section_label": topic,
+        "slides": slides,
+    }
 
 
 def build_mock_plan() -> dict[str, Any]:
@@ -2369,7 +2567,7 @@ def generate_slide_plan(
     use_mock: bool,
 ) -> tuple[dict[str, Any], str]:
     if use_mock:
-        plan = normalize_slide_plan(build_mock_plan(), template_analysis)
+        plan = normalize_slide_plan(build_prompt_based_mock_plan(prompt_text), template_analysis)
         raw_text = json.dumps(plan, ensure_ascii=False, indent=2)
         return plan, raw_text
     plan, raw_text = generate_slide_plan_with_llm(prompt_text, template_analysis, model)
@@ -2423,10 +2621,10 @@ def render_presentation_with_images(
             print(f"[{index}/{total_slides}] 다이어그램 렌더링 완료")
 
         image_prompt = (slide_data.get("image_prompt") or "").strip()
-        cached_image_path = get_cached_image_path(image_output_dir, index)
+        cached_image_path = get_cached_image_path(image_output_dir, index, image_prompt)
         target_image_size = get_target_image_size_for_slide(source_slide)
 
-        if cached_image_path.exists():
+        if image_prompt and client and cached_image_path.exists():
             if client and not image_matches_target_size(cached_image_path, target_image_size):
                 try:
                     cached_image_path.unlink()
@@ -2491,6 +2689,7 @@ def main() -> None:
         else build_json_output_path()
     )
     raw_output_path = build_raw_output_path()
+    slide_plan_meta_path = build_slide_plan_meta_path()
     analysis_output_path = (
         Path(args.analysis_output).expanduser().resolve()
         if args.analysis_output
@@ -2526,9 +2725,13 @@ def main() -> None:
             )
 
     if not sessions:
+        cache_key = build_slide_plan_cache_key(prompt_template, args.model, args.mock)
         try:
             cached_plan, cached_raw_text = load_cached_slide_plan(
-                json_output_path, raw_output_path
+                json_output_path,
+                raw_output_path,
+                cache_key=cache_key,
+                meta_path=slide_plan_meta_path,
             )
             if cached_plan is not None:
                 print("[단일 작업] 기존 slide_plan 재사용")
@@ -2546,6 +2749,7 @@ def main() -> None:
             )
             if raw_response_text:
                 raw_output_path.write_text(raw_response_text, encoding="utf-8")
+            write_slide_plan_cache_meta(slide_plan_meta_path, cache_key)
             render_presentation_with_images(
                 template_path=template_path,
                 plan=slide_plan,
@@ -2594,6 +2798,8 @@ def main() -> None:
         session_ppt_path = OUTPUT_DIR / f"{file_prefix}.pptx"
         full_session_json_path = build_session_plan_path(session_prefix)
         full_session_raw_path = build_session_raw_path(session_prefix)
+        full_session_meta_path = build_session_plan_meta_path(session_prefix)
+        cache_key = build_slide_plan_cache_key(session_prompt_text, args.model, args.mock)
 
         print(
             f"[교시 {session_index}/{total_sessions}] 생성 시작: {session['session_no']}교시 {session['title']}"
@@ -2602,7 +2808,10 @@ def main() -> None:
 
         try:
             cached_plan, cached_raw_text = load_cached_slide_plan(
-                full_session_json_path, full_session_raw_path
+                full_session_json_path,
+                full_session_raw_path,
+                cache_key=cache_key,
+                meta_path=full_session_meta_path,
             )
             if cached_plan is not None:
                 print(
@@ -2630,6 +2839,7 @@ def main() -> None:
                 json.dumps(full_slide_plan, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            write_slide_plan_cache_meta(full_session_meta_path, cache_key)
 
             print(f"[교시 {session_index}/{total_sessions}] PPT 렌더링 시작")
             render_presentation_with_images(
