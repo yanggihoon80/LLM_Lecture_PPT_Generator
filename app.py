@@ -34,7 +34,7 @@ LANDSCAPE_IMAGE_SAFE_MARGIN_RATIO = 0.08
 LANDSCAPE_IMAGE_LEFT_SAFE_MARGIN_RATIO = 0.14
 
 DEFAULT_PROMPT_FILE = PROMPTS_DIR / "lecture_prompt.txt"
-DEFAULT_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.txt"
+DEFAULT_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.md"
 DIAGRAM_FILL_RGB = RGBColor(157, 195, 230)  # #9DC3E6
 DIAGRAM_LINE_RGB = RGBColor(91, 155, 213)
 DEFAULT_ENV_FILE = BASE_DIR / ".env"
@@ -144,7 +144,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--curriculum-file",
-        help="Curriculum text file path for multi-session generation. Default: ./prompts/curriculum.txt when present",
+        help="Curriculum markdown/text file path for multi-session generation. Default: ./prompts/curriculum.md",
     )
     parser.add_argument(
         "--lecture",
@@ -304,22 +304,51 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
 
-    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
-    header_pattern = re.compile(r".*?(\d+)교시\s*[\.:：]?\s*(.+)")
-    labeled_meta_pattern = re.compile(
-        r"^\s*(메모|참고|실습|주의|비고|목표|준비물|과제)\s*[:：]\s*(.+)$"
+    lines = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines()]
+    header_pattern = re.compile(
+        r"^\s*(?:#{1,6}\s*)?(?:[^\w\d가-힣]*\s*)?(\d+)교시\s*[\.:：]\s*(.+)$"
     )
-    bracket_meta_pattern = re.compile(
-        r"^\s*\[(메모|참고|실습|주의|비고|목표|준비물|과제)\]\s*(.+)$"
+    meta_labels = {
+        "메모",
+        "참고",
+        "실습",
+        "주의",
+        "비고",
+        "목표",
+        "준비물",
+        "과제",
+        "핵심 구조",
+        "AI 활용",
+        "핵심 메시지",
+    }
+    core_labels = {
+        "핵심 내용",
+        "내용",
+        "프로젝트 목적",
+        "프로젝트 순서",
+        "각 STEP",
+        "최종 결과물",
+    }
+    label_names = "|".join(
+        re.escape(label)
+        for label in sorted(meta_labels | core_labels, key=len, reverse=True)
     )
+    labeled_meta_pattern = re.compile(rf"^\s*({label_names})\s*[:：]\s*(.+)$")
+    bracket_meta_pattern = re.compile(rf"^\s*\[({label_names})\]\s*(.+)$")
 
     sessions: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     pending_label: str | None = None
+    current_section = "core"
 
     for line in lines:
         if not line:
             continue
+        if set(line) <= {"─", "-", "_", " "}:
+            continue
+
+        line = re.sub(r"^\s*#{1,6}\s*", "", line).strip()
+        line = re.sub(r"^\s*[*_]{1,3}(.+?)[*_]{1,3}\s*$", r"\1", line).strip()
 
         header_match = header_pattern.match(line)
         if header_match:
@@ -332,28 +361,46 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
                 "meta": {},
             }
             pending_label = None
+            current_section = "core"
             continue
 
         if current is None:
+            continue
+
+        normalized_label = re.sub(r"^[^\w\d가-힣\[]+\s*", "", line).strip().rstrip(":：")
+        if normalized_label in core_labels:
+            current_section = "core"
+            pending_label = None
+            continue
+        if normalized_label in meta_labels:
+            current_section = "meta"
+            pending_label = normalized_label
             continue
 
         if line.startswith("🟩 [") or line.startswith("🟦 ["):
             continue
 
         if line.startswith("👉"):
-            pending_label = line.replace("👉", "").strip() or None
+            value = line.replace("👉", "").strip()
+            if pending_label and value:
+                current["meta"].setdefault(pending_label, []).append(value)
+            elif value:
+                current["core_points"].append(value)
             continue
 
         if pending_label:
             current["meta"].setdefault(pending_label, []).append(line)
-            pending_label = None
+            if current_section != "meta":
+                pending_label = None
             continue
 
         labeled_meta_match = labeled_meta_pattern.match(line)
         if labeled_meta_match:
             label = labeled_meta_match.group(1).strip()
             value = labeled_meta_match.group(2).strip()
-            if value:
+            if label in core_labels and value:
+                current["core_points"].append(value)
+            elif value:
                 current["meta"].setdefault(label, []).append(value)
             continue
 
@@ -361,14 +408,19 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
         if bracket_meta_match:
             label = bracket_meta_match.group(1).strip()
             value = bracket_meta_match.group(2).strip()
-            if value:
+            if label in core_labels and value:
+                current["core_points"].append(value)
+            elif value:
                 current["meta"].setdefault(label, []).append(value)
             continue
 
         normalized_line = re.sub(r"^\s*[-•·●▪◦]\s*", "", line).strip()
         normalized_line = re.sub(r"^\s*\d+[\.\)]\s*", "", normalized_line).strip()
         if normalized_line:
-            current["core_points"].append(normalized_line)
+            if current_section == "meta" and pending_label:
+                current["meta"].setdefault(pending_label, []).append(normalized_line)
+            else:
+                current["core_points"].append(normalized_line)
 
     if current:
         sessions.append(current)

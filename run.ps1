@@ -3,6 +3,7 @@ param(
     [switch]$Mock,
     [switch]$GoogleSafe,
     [string]$PromptFile,
+    [string]$CurriculumFile,
     [string]$TemplateFile,
     [string]$Model,
     [string]$lecture,
@@ -130,6 +131,11 @@ if ($GoogleSafe) {
 if ($PromptFile) {
     $ArgsList += "--prompt-file"
     $ArgsList += $PromptFile
+}
+
+if ($CurriculumFile) {
+    $ArgsList += "--curriculum-file"
+    $ArgsList += $CurriculumFile
 }
 
 if ($TemplateFile) {
