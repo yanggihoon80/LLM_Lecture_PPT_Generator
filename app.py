@@ -431,7 +431,12 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
             continue
 
         if pending_label:
-            current["meta"].setdefault(pending_label, []).append(line)
+            normalized_meta_line = re.sub(r"^\s*[-•·●▪◦]\s*", "", line).strip()
+            normalized_meta_line = re.sub(
+                r"^\s*\d+[\.\)]\s*", "", normalized_meta_line
+            ).strip()
+            if normalized_meta_line:
+                current["meta"].setdefault(pending_label, []).append(normalized_meta_line)
             if current_section != "meta":
                 pending_label = None
             continue
