@@ -7,7 +7,7 @@
 프로그램은 아래 순서로 동작합니다.
 
 1. `template/` 폴더의 템플릿 PPT를 분석합니다.
-2. `prompts/curriculum.md`에서 교시별 주제와 핵심 내용을 읽습니다.
+2. `prompts/curriculum.md`에서 교시별 주제와 핵심 내용을 읽습니다. 없으면 `prompts/curriculum.txt`를 사용합니다.
 3. `prompts/lecture_prompt.txt`의 공통 프롬프트를 교시별 내용으로 채웁니다.
 4. OpenAI API를 호출해 슬라이드 구조 JSON을 생성합니다.
 5. JSON을 바탕으로 교시별 PPT를 생성합니다.
@@ -24,7 +24,7 @@ linkvalue_llm_lecture_ppt_generator/
 ├─ template/
 ├─ prompts/
 │  ├─ lecture_prompt.txt
-│  └─ curriculum.md
+│  └─ curriculum.md 또는 curriculum.txt
 └─ output/
 ```
 
@@ -56,7 +56,7 @@ linkvalue_llm_lecture_ppt_generator/
 - 불릿, 표, 다이어그램 중 적절한 형식을 선택할 것
 - 발표용 문장 톤으로 작성할 것
 
-### curriculum.md
+### curriculum.md 또는 curriculum.txt
 교시별 제목과 핵심 내용을 적는 파일입니다.  
 교시 수만큼 PPT가 생성되며, 각 교시의 제목과 핵심 내용이 여기서 결정됩니다.
 
@@ -276,7 +276,7 @@ LLM을 호출하지 않고 내장된 샘플 슬라이드 데이터로 PPT 생성
 - `-lecture 1,3`: 1교시와 3교시만 생성
 
 ### 다른 커리큘럼 파일로 실행
-기본 커리큘럼 파일은 `prompts/curriculum.md`입니다.  
+기본 커리큘럼 파일은 `prompts/curriculum.md`입니다. 해당 파일이 없으면 `prompts/curriculum.txt`를 사용합니다.  
 다른 Markdown 또는 텍스트 파일을 사용하려면 `-CurriculumFile` 옵션을 사용합니다.
 
 ```powershell

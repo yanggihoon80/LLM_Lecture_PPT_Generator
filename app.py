@@ -36,6 +36,7 @@ LANDSCAPE_IMAGE_LEFT_SAFE_MARGIN_RATIO = 0.14
 
 DEFAULT_PROMPT_FILE = PROMPTS_DIR / "lecture_prompt.txt"
 DEFAULT_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.md"
+DEFAULT_FALLBACK_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.txt"
 DIAGRAM_FILL_RGB = RGBColor(157, 195, 230)  # #9DC3E6
 DIAGRAM_LINE_RGB = RGBColor(91, 155, 213)
 DEFAULT_ENV_FILE = BASE_DIR / ".env"
@@ -218,6 +219,14 @@ def find_default_template() -> Path:
     return max(pool, key=lambda path: path.stat().st_mtime)
 
 
+def find_default_curriculum_file() -> Path:
+    if DEFAULT_CURRICULUM_FILE.exists():
+        return DEFAULT_CURRICULUM_FILE.resolve()
+    if DEFAULT_FALLBACK_CURRICULUM_FILE.exists():
+        return DEFAULT_FALLBACK_CURRICULUM_FILE.resolve()
+    return DEFAULT_CURRICULUM_FILE.resolve()
+
+
 def build_output_path(template_path: Path) -> Path:
     return OUTPUT_DIR / f"generated_{template_path.stem}.pptx"
 
@@ -366,7 +375,11 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
     core_labels = {
         "핵심 내용",
         "내용",
+        "기술 개념 보완",
+        "실무 예시",
+        "실무 사례 매핑",
         "프로젝트 목적",
+        "프로젝트 흐름",
         "프로젝트 순서",
         "각 STEP",
         "최종 결과물",
@@ -2680,7 +2693,7 @@ def main() -> None:
     curriculum_path = (
         Path(args.curriculum_file).expanduser().resolve()
         if args.curriculum_file
-        else DEFAULT_CURRICULUM_FILE.resolve()
+        else find_default_curriculum_file()
     )
     prompt_file = Path(args.prompt_file).expanduser().resolve()
     output_path = (
