@@ -188,24 +188,58 @@ linkvalue_llm_lecture_ppt_generator/
 예시:
 
 ```env
+LLM_PROVIDER=openai_api
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.4
 OPENAI_ENABLE_IMAGE_GENERATION=false
 # OPENAI_IMAGE_MODEL=gpt-image-1
 # OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_TIMEOUT_SECONDS=300
+# CODEX_CLI_COMMAND=codex
+# CODEX_CLI_TIMEOUT_SECONDS=300
 CONTINUE_ON_SESSION_ERROR=true
 ```
 
 설명:
 
+- `LLM_PROVIDER`: 슬라이드 구조 생성 방식. `openai_api` 또는 `codex_cli`
 - `OPENAI_API_KEY`: OpenAI API 키
 - `OPENAI_MODEL`: 슬라이드 구조 생성에 사용할 모델
 - `OPENAI_ENABLE_IMAGE_GENERATION`: 이미지 생성 사용 여부
 - `OPENAI_IMAGE_MODEL`: 이미지 생성 모델
 - `OPENAI_BASE_URL`: 필요 시 사용자 지정 API 엔드포인트
 - `OPENAI_TIMEOUT_SECONDS`: API 대기 시간
+- `CODEX_CLI_COMMAND`: Codex CLI 실행 명령. 기본값은 `codex`
+- `CODEX_CLI_TIMEOUT_SECONDS`: Codex CLI 대기 시간. 없으면 `OPENAI_TIMEOUT_SECONDS`를 사용
 - `CONTINUE_ON_SESSION_ERROR`: 특정 교시 실패 시 다음 교시 계속 진행할지 여부
+
+### API와 Codex CLI 선택
+
+기본값은 기존과 동일하게 OpenAI API를 직접 호출합니다.
+
+```env
+LLM_PROVIDER=openai_api
+OPENAI_API_KEY=sk-...
+```
+
+Codex CLI로 슬라이드 구조 JSON을 생성하려면 Codex CLI에 먼저 로그인한 뒤 `.env`에서 provider만 바꿉니다.
+
+```powershell
+codex login
+```
+
+```env
+LLM_PROVIDER=codex_cli
+OPENAI_MODEL=gpt-5.4
+# CODEX_CLI_COMMAND=codex
+# CODEX_CLI_TIMEOUT_SECONDS=300
+```
+
+참고:
+
+- `codex_cli`는 슬라이드 구조 JSON 생성에만 사용됩니다.
+- 이미지 생성은 기존처럼 OpenAI API 이미지 엔드포인트를 사용하므로 `OPENAI_ENABLE_IMAGE_GENERATION=true`이면 `OPENAI_API_KEY`가 필요합니다.
+- `LLM_PROVIDER`는 캐시 키에 포함되므로 API 생성 결과와 Codex CLI 생성 결과가 서로 섞이지 않습니다.
 
 ## 실행 방법
 먼저 프로젝트 폴더로 이동합니다.

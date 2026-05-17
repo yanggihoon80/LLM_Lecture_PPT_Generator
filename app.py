@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageChops, ImageOps
 from pptx.dml.color import RGBColor
 from pptx import Presentation
 from pptx.enum.text import MSO_VERTICAL_ANCHOR, PP_ALIGN
@@ -33,6 +33,8 @@ IMAGES_DIR = OUTPUT_DIR / "images"
 GOOGLE_SAFE_MODE = True
 LANDSCAPE_IMAGE_SAFE_MARGIN_RATIO = 0.08
 LANDSCAPE_IMAGE_LEFT_SAFE_MARGIN_RATIO = 0.14
+IMAGE_MARGIN_TRIM_TOLERANCE = 28
+IMAGE_MARGIN_TRIM_PADDING_RATIO = 0.015
 
 DEFAULT_PROMPT_FILE = PROMPTS_DIR / "lecture_prompt.txt"
 DEFAULT_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.md"
@@ -40,6 +42,8 @@ DEFAULT_FALLBACK_CURRICULUM_FILE = PROMPTS_DIR / "curriculum.txt"
 DIAGRAM_FILL_RGB = RGBColor(157, 195, 230)  # #9DC3E6
 DIAGRAM_LINE_RGB = RGBColor(91, 155, 213)
 DEFAULT_ENV_FILE = BASE_DIR / ".env"
+LLM_PROVIDER_OPENAI_API = "openai_api"
+LLM_PROVIDER_CODEX_CLI = "codex_cli"
 
 
 JSON_FORMAT_GUIDE = """
@@ -129,6 +133,22 @@ def env_flag(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_llm_provider() -> str:
+    provider = os.getenv("LLM_PROVIDER", LLM_PROVIDER_OPENAI_API).strip().lower()
+    aliases = {
+        "api": LLM_PROVIDER_OPENAI_API,
+        "openai": LLM_PROVIDER_OPENAI_API,
+        "openai_api": LLM_PROVIDER_OPENAI_API,
+        "codex": LLM_PROVIDER_CODEX_CLI,
+        "codex_cli": LLM_PROVIDER_CODEX_CLI,
+        "cli": LLM_PROVIDER_CODEX_CLI,
+    }
+    if provider not in aliases:
+        valid_values = ", ".join(sorted({LLM_PROVIDER_OPENAI_API, LLM_PROVIDER_CODEX_CLI}))
+        raise ValueError(f"Invalid LLM_PROVIDER '{provider}'. Use one of: {valid_values}.")
+    return aliases[provider]
 
 
 def parse_args() -> argparse.Namespace:
@@ -259,12 +279,15 @@ def build_session_plan_meta_path(session_prefix: str) -> Path:
     return OUTPUT_DIR / f"{session_prefix}_slide_plan.meta.json"
 
 
-def build_slide_plan_cache_key(prompt_text: str, model: str, use_mock: bool) -> str:
+def build_slide_plan_cache_key(
+    prompt_text: str, model: str, use_mock: bool, llm_provider: str
+) -> str:
     payload = json.dumps(
         {
             "prompt_text": prompt_text,
             "model": model,
             "mock": use_mock,
+            "llm_provider": llm_provider,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1762,6 +1785,15 @@ def get_openai_client() -> OpenAI:
 def generate_slide_plan_with_llm(
     prompt_text: str, template_analysis: dict[str, Any], model: str
 ) -> tuple[dict[str, Any], str]:
+    llm_provider = get_llm_provider()
+    if llm_provider == LLM_PROVIDER_CODEX_CLI:
+        return generate_slide_plan_with_codex_cli(prompt_text, template_analysis, model)
+    return generate_slide_plan_with_openai_api(prompt_text, template_analysis, model)
+
+
+def generate_slide_plan_with_openai_api(
+    prompt_text: str, template_analysis: dict[str, Any], model: str
+) -> tuple[dict[str, Any], str]:
     client = get_openai_client()
 
     response = client.responses.create(
@@ -1795,6 +1827,71 @@ def generate_slide_plan_with_llm(
         raise LLMJSONParseError(str(exc), raw_text) from exc
 
 
+def generate_slide_plan_with_codex_cli(
+    prompt_text: str, template_analysis: dict[str, Any], model: str
+) -> tuple[dict[str, Any], str]:
+    codex_command = os.getenv("CODEX_CLI_COMMAND", "codex").strip() or "codex"
+    timeout_seconds = float(
+        os.getenv("CODEX_CLI_TIMEOUT_SECONDS", os.getenv("OPENAI_TIMEOUT_SECONDS", "300"))
+    )
+    last_message_path = OUTPUT_DIR / "codex_cli_last_message.txt"
+    full_prompt = (
+        "You are a lecture deck planner. Output JSON only. "
+        "Do not edit files, do not run shell commands, and do not include markdown fences.\n\n"
+        f"{build_llm_prompt(prompt_text, template_analysis)}"
+    )
+    command = [
+        codex_command,
+        "-a",
+        "never",
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--output-last-message",
+        str(last_message_path),
+        "-",
+    ]
+    if model:
+        command[4:4] = ["--model", model]
+
+    try:
+        completed = subprocess.run(
+            command,
+            input=full_prompt,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=timeout_seconds,
+            cwd=str(BASE_DIR),
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise EnvironmentError(
+            f"Codex CLI command not found: {codex_command}. Install Codex CLI or set CODEX_CLI_COMMAND."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Codex CLI timed out after {timeout_seconds:g} seconds."
+        ) from exc
+
+    raw_text = ""
+    if last_message_path.exists():
+        raw_text = last_message_path.read_text(encoding="utf-8")
+    if not raw_text.strip():
+        raw_text = (completed.stdout or "").strip()
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        raise RuntimeError(
+            f"Codex CLI failed with exit code {completed.returncode}.\n{stderr}"
+        )
+
+    try:
+        return extract_json_block(raw_text), raw_text
+    except LLMJSONParseError as exc:
+        raise LLMJSONParseError(str(exc), raw_text) from exc
+
+
 def generate_slide_image(
     client: OpenAI,
     image_prompt: str,
@@ -1819,7 +1916,9 @@ def generate_slide_image(
         raise ValueError("Image generation response did not include b64_json data.")
 
     image_path.write_bytes(base64.b64decode(image_base64))
-    add_landscape_safe_margins(image_path)
+    trim_image_border_margins(image_path)
+    if env_flag("OPENAI_ADD_IMAGE_SAFE_MARGINS", False):
+        add_landscape_safe_margins(image_path)
     return image_path
 
 
@@ -1839,13 +1938,90 @@ def enhance_image_prompt(image_prompt: str) -> str:
         return base_prompt
 
     safety_suffix = (
-        " wide horizontal composition, landscape illustration, centered subject, "
-        "leave generous empty padding on the left and right edges, keep all important subjects "
-        "inside the central 70 percent of the image, no objects touching the left border, "
-        "safe margins on all sides, no cropped head or hands, no important details near edges, "
+        " wide horizontal composition, landscape illustration, subject fills the frame, "
+        "balanced composition, no thick blank border, no empty white margins, "
+        "no cropped head or hands, no important details near edges, "
         "no embedded text, no letters, no words, no labels"
     )
     return f"{base_prompt}, {safety_suffix}"
+
+
+def average_corner_color(image: Image.Image, sample_size: int) -> tuple[int, int, int]:
+    width, height = image.size
+    sample_size = max(1, min(sample_size, width, height))
+    boxes = [
+        (0, 0, sample_size, sample_size),
+        (width - sample_size, 0, width, sample_size),
+        (0, height - sample_size, sample_size, height),
+        (width - sample_size, height - sample_size, width, height),
+    ]
+    totals = [0, 0, 0]
+    count = 0
+    for box in boxes:
+        for red, green, blue in image.crop(box).getdata():
+            totals[0] += red
+            totals[1] += green
+            totals[2] += blue
+            count += 1
+    if count <= 0:
+        return (255, 255, 255)
+    return tuple(int(round(value / count)) for value in totals)
+
+
+def trim_image_border_margins(image_path: Path) -> None:
+    try:
+        with Image.open(image_path) as img:
+            original = img.convert("RGBA")
+    except Exception:
+        return
+
+    width, height = original.size
+    if width <= 0 or height <= 0:
+        return
+
+    rgb = Image.new("RGBA", original.size, (255, 255, 255, 255))
+    rgb.alpha_composite(original)
+    rgb = rgb.convert("RGB")
+    corner_size = max(4, min(width, height) // 40)
+    background_color = average_corner_color(rgb, corner_size)
+    background = Image.new("RGB", rgb.size, background_color)
+    diff = ImageChops.difference(rgb, background).convert("L")
+    mask = diff.point(
+        lambda value: 255 if value > IMAGE_MARGIN_TRIM_TOLERANCE else 0,
+        mode="1",
+    )
+    bbox = mask.getbbox()
+    if not bbox:
+        return
+
+    left, top, right, bottom = bbox
+    padding_x = int(round(width * IMAGE_MARGIN_TRIM_PADDING_RATIO))
+    padding_y = int(round(height * IMAGE_MARGIN_TRIM_PADDING_RATIO))
+    left = max(0, left - padding_x)
+    top = max(0, top - padding_y)
+    right = min(width, right + padding_x)
+    bottom = min(height, bottom + padding_y)
+
+    crop_width = right - left
+    crop_height = bottom - top
+    if crop_width <= 0 or crop_height <= 0:
+        return
+
+    margin_x = left + (width - right)
+    margin_y = top + (height - bottom)
+    if margin_x < width * 0.04 and margin_y < height * 0.04:
+        return
+    if crop_width < width * 0.35 or crop_height < height * 0.35:
+        return
+
+    cropped = rgb.crop((left, top, right, bottom))
+    fitted = ImageOps.fit(
+        cropped,
+        (width, height),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+    fitted.save(image_path)
 
 
 def add_landscape_safe_margins(image_path: Path) -> None:
@@ -2650,6 +2826,7 @@ def render_presentation_with_images(
                 except OSError:
                     pass
             else:
+                trim_image_border_margins(cached_image_path)
                 replace_slide_image(slide, source_slide, cached_image_path)
                 print(f"[{index}/{total_slides}] 기존 이미지 재사용")
                 continue
@@ -2684,6 +2861,7 @@ def main() -> None:
     args = parse_args()
     GOOGLE_SAFE_MODE = True
     image_generation_enabled = env_flag("OPENAI_ENABLE_IMAGE_GENERATION", False)
+    llm_provider = get_llm_provider()
 
     template_path = (
         Path(args.template).expanduser().resolve()
@@ -2743,7 +2921,9 @@ def main() -> None:
             )
 
     if not sessions:
-        cache_key = build_slide_plan_cache_key(prompt_template, args.model, args.mock)
+        cache_key = build_slide_plan_cache_key(
+            prompt_template, args.model, args.mock, llm_provider
+        )
         try:
             cached_plan, cached_raw_text = load_cached_slide_plan(
                 json_output_path,
@@ -2817,7 +2997,9 @@ def main() -> None:
         full_session_json_path = build_session_plan_path(session_prefix)
         full_session_raw_path = build_session_raw_path(session_prefix)
         full_session_meta_path = build_session_plan_meta_path(session_prefix)
-        cache_key = build_slide_plan_cache_key(session_prompt_text, args.model, args.mock)
+        cache_key = build_slide_plan_cache_key(
+            session_prompt_text, args.model, args.mock, llm_provider
+        )
 
         print(
             f"[교시 {session_index}/{total_sessions}] 생성 시작: {session['session_no']}교시 {session['title']}"
