@@ -445,7 +445,7 @@ def parse_curriculum_file(path: Path) -> list[dict[str, Any]]:
         if current is None:
             continue
 
-        normalized_label = re.sub(r"^[^\w\d가-힣\[]+\s*", "", line).strip().rstrip(":：")
+        normalized_label = re.sub(r"^[^\w\d가-힣\[]+\s*", "", line).strip().rstrip(":\uff1a")
         if normalized_label in core_labels:
             current_section = "core"
             pending_label = None
